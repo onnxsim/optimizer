@@ -60,6 +60,7 @@
 #include "onnxoptimizer/passes/fuse_consecutive_slices.h"
 #include "onnxoptimizer/passes/eliminate_common_subexpression.h"
 #include "onnxoptimizer/passes/fuse_qkv.h"
+#include "onnxoptimizer/passes/fuse_logsoftmax.h"
 #include "onnxoptimizer/passes/fuse_consecutive_unsqueezes.h"
 #include "onnxoptimizer/passes/eliminate_nop_with_unit.h"
 #include "onnxoptimizer/passes/rewrite_input_dtype.h"
@@ -114,6 +115,7 @@ struct GlobalPassRegistry {
     registerPass<EliminateOpWithUnit>();
     registerPass<EliminateCommonSubexpression>();
     registerPass<FuseQKV>();
+    registerPass<FuseLogSoftmax>();
     registerPass<FuseConsecutiveUnsqueezes>();
     registerPass<EliminateDeadEnd>();
     registerPass<EliminateIdentity>();
