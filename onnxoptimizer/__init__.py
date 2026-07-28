@@ -33,13 +33,23 @@ from .version import version as __version__  # noqa
 
 
 def optimize(
-    model: onnx.ModelProto, passes: list[str] | None = None, fixed_point: bool = False
+    model: onnx.ModelProto,
+    passes: list[str] | None = None,
+    fixed_point: bool = False,
+    initializers_as_constants: bool = True,
 ) -> onnx.ModelProto:
     """Apply the optimization on the serialized ModelProto.
 
     Arguments:
         model: ONNX model.
         passes: Optimization names.
+        fixed_point: Whether to run the passes to a fixed point.
+        initializers_as_constants: Whether the passes may treat graph
+            initializers as constant tensors (the default, ``True``). When set
+            to ``False`` initializers are treated as non-constant, so
+            value-baking passes such as ``fuse_bn_into_conv`` leave
+            initializer-backed weights untouched; ``Constant`` nodes are still
+            treated as constants.
 
     Return:
         Optimized model.
@@ -49,6 +59,20 @@ def optimize(
         passes = get_fuse_and_elimination_passes()
     if not isinstance(model, onnx.ModelProto):
         raise TypeError(f"Optimizer only accepts ModelProto, incorrect type: {type(model)}")
+    # The C++ core reads this switch from thread-local state deep inside the
+    # passes, so set it around the call and restore it afterwards to avoid
+    # leaking the setting to unrelated callers on the same thread.
+    previous = _c.initializers_as_constants()
+    _c.set_initializers_as_constants(initializers_as_constants)
+    try:
+        return _optimize_impl(model, passes, fixed_point)
+    finally:
+        _c.set_initializers_as_constants(previous)
+
+
+def _optimize_impl(
+    model: onnx.ModelProto, passes: list[str], fixed_point: bool
+) -> onnx.ModelProto:
     try:
         model_str = model.SerializeToString()
         if fixed_point:
