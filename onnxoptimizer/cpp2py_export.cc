@@ -76,5 +76,11 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
                              &optimization::GetAvailablePasses);
   onnx_opt_cpp2py_export.def("get_fuse_and_elimination_passes",
                              &optimization::GetFuseAndEliminationPass);
+  // Toggle whether the passes treat graph initializers as constant tensors
+  // (default true). See SetInitializersAsConstants in optimize.h.
+  onnx_opt_cpp2py_export.def("set_initializers_as_constants",
+                             &optimization::SetInitializersAsConstants);
+  onnx_opt_cpp2py_export.def("initializers_as_constants",
+                             &optimization::InitializersAsConstants);
 }
 }  // namespace ONNX_NAMESPACE
