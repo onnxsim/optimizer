@@ -22,22 +22,35 @@ struct EliminateNopDropout final : public PredicateBasedPass {
   }
 
   bool patternMatchPredicate(Node* node) override {
-    // in opset 12, ratio is an input of Dropout rather than an attribute,
-    // however we don't want to to remove Dropout fro opset 12+, since it
-    // supports training-friendly models, for which the Dropout ops are required
-    return (node->kind() == kDropout && node->hasAttribute(kratio)) &&
-           node->f(kratio) == 0.0;
+    // When ratio is an *attribute* (ONNX opset < 12) the node is the
+    // inference-only form of Dropout: at test time its data output equals its
+    // input, so it is a no-op regardless of the ratio value. The previous
+    // predicate only matched ratio == 0.0 and therefore left real-world
+    // inference exports (e.g. GoogLeNet/Inception, which carry ratio=0.5 with an
+    // unused mask output) untouched. We now match any attribute-ratio Dropout.
+    //
+    // Opset >= 12 encodes ratio/training_mode as inputs (no ratio attribute) so
+    // this predicate does not match them, leaving training graphs alone.
+    if (node->kind() != kDropout || !node->hasAttribute(kratio)) {
+      return false;
+    }
+    // The optional mask output (index 1) is only meaningful for training and
+    // cannot be replaced by the input, so only fold when it is unused.
+    if (node->outputs().size() > 1 && !node->outputs()[1]->uses().empty()) {
+      return false;
+    }
+    return true;
   }
 
   bool runTransform(Node* node, Graph& graph,
                     NodeDestroyType& destroy_current) override {
-    // Don't assume that theres only one output.
-    for (size_t i = 0; i < node->outputs().size(); ++i) {
-      const bool replacing_success =
-          tryReplacingAllUsesWith(node->outputs()[i], node->input());
-      if (!replacing_success) {
-        return false;
-      }
+    // The data output (index 0) is an identity on the input at inference time.
+    // Any mask output is unused (guaranteed by the predicate) and disappears
+    // with the node.
+    const bool replacing_success =
+        tryReplacingAllUsesWith(node->outputs()[0], node->input());
+    if (!replacing_success) {
+      return false;
     }
     destroy_current = NodeDestroyType::DestroyOne;
     return true;
