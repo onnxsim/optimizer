@@ -3544,6 +3544,74 @@ class TestOptimizer(unittest.TestCase):
                 for node in optimized_model.graph.node
             )
 
+    def _make_conv_bn_model(self):  # type: () -> ModelProto
+        tensor_type, np_type = TensorProto.FLOAT, np.float32
+        conv = helper.make_node("Conv", ["X", "W", "B"], ["Y"])
+        bn = helper.make_node(
+            "BatchNormalization", ["Y", "scale", "b", "mean", "var"], ["Z"]
+        )
+        W = np.random.randn(3, 2, 5, 5).astype(np_type) + 2
+        B = np.random.randn(3).astype(np_type) + 2
+        scale = np.random.randn(3).astype(np_type) + 2
+        b = np.random.randn(3).astype(np_type) + 2
+        mean = np.random.randn(3).astype(np_type) + 2
+        var = np.abs(np.random.randn(3).astype(np_type)) + 2
+        initializers = [
+            helper.make_tensor(name, tensor_type, npa.shape, npa.tobytes(), raw=True)
+            for name, npa in [
+                ("W", W),
+                ("B", B),
+                ("scale", scale),
+                ("b", b),
+                ("mean", mean),
+                ("var", var),
+            ]
+        ]
+        graph = helper.make_graph(
+            [conv, bn],
+            "test",
+            [helper.make_tensor_value_info("X", tensor_type, (5, 2, 28, 28))],
+            [helper.make_tensor_value_info("Z", tensor_type, (5, 3, 24, 24))],
+            initializer=initializers,
+            value_info=[
+                helper.make_tensor_value_info("Y", tensor_type, (5, 3, 24, 24))
+            ],
+        )
+        return helper.make_model(
+            graph,
+            producer_name="onnx-test",
+            opset_imports=[helper.make_opsetid("", LATEST_STABLE_OPSET_VERSION)],
+            ir_version=10,
+        )
+
+    def test_fuse_bn_into_conv_default_treats_initializers_as_constants(self):
+        # With the default behaviour the BatchNormalization initializers are
+        # constants, so fuse_bn_into_conv folds the BN into the Conv weights.
+        model = self._make_conv_bn_model()
+        optimized = onnxoptimizer.optimize(model, ["fuse_bn_into_conv"])
+        op_types = [n.op_type for n in optimized.graph.node]
+        assert "BatchNormalization" not in op_types
+
+    def test_initializers_as_non_constants_disables_fuse_bn(self):
+        # Treating initializers as non-constant leaves the BN weights alone, so
+        # the pass cannot fold BatchNormalization into the Conv.
+        model = self._make_conv_bn_model()
+        optimized = onnxoptimizer.optimize(
+            model, ["fuse_bn_into_conv"], initializers_as_constants=False
+        )
+        op_types = [n.op_type for n in optimized.graph.node]
+        assert "BatchNormalization" in op_types
+        assert "Conv" in op_types
+
+    def test_initializers_as_constants_flag_is_restored(self):
+        # onnxoptimizer.optimize must not leak the thread-local switch it sets.
+        assert onnxoptimizer.onnx_opt_cpp2py_export.initializers_as_constants()
+        model = self._make_conv_bn_model()
+        onnxoptimizer.optimize(
+            model, ["fuse_bn_into_conv"], initializers_as_constants=False
+        )
+        assert onnxoptimizer.onnx_opt_cpp2py_export.initializers_as_constants()
+
     def _internal_test_deadend_elimination(self, fixed):  # type: (bool) -> None
         softmax = helper.make_node("Softmax", ["X"], ["Y"], axis=2)
         log = helper.make_node("Log", ["Y"], ["Z"])
