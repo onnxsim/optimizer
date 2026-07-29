@@ -1649,6 +1649,200 @@ class TestOptimizer(unittest.TestCase):
 
         assert optimized_model.graph == graph
 
+    def test_fuse_matmul_add_bias_into_gemm_batched(self):  # type: () -> None
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4))],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 3, 5))],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_matmul_add_bias_into_gemm_batched", "eliminate_deadend"],
+        )
+
+        op_types = [n.op_type for n in optimized_model.graph.node]
+        assert op_types == ["Reshape", "Gemm", "Reshape"]
+        assert "MatMul" not in op_types
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_dynamic(self):
+        # dynamic leading dims -> Shape/Slice/Concat rebuild the output shape
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [
+                helper.make_tensor_value_info(
+                    "X", TensorProto.FLOAT, ("batch", "seq", 4)
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "A", TensorProto.FLOAT, ("batch", "seq", 5)
+                )
+            ],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_matmul_add_bias_into_gemm_batched", "eliminate_deadend"],
+            compare_result=False,
+        )
+
+        op_types = [n.op_type for n in optimized_model.graph.node]
+        assert "Gemm" in op_types
+        assert "MatMul" not in op_types
+        assert op_types[-1] == "Reshape"
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_2d_no_fuse(self):
+        # rank-2 matmul is handled by the non-batched pass; this one must skip it
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (3, 4))],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (3, 5))],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_matmul_add_bias_into_gemm_batched"]
+        )
+
+        assert [n.op_type for n in optimized_model.graph.node] == ["MatMul", "Add"]
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_nonconst_weight_no_fuse(self):
+        # W is a runtime input, not a constant -> cannot form a Gemm weight
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4)),
+                helper.make_tensor_value_info("W", TensorProto.FLOAT, (4, 5)),
+            ],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 3, 5))],
+            initializer=[b],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_matmul_add_bias_into_gemm_batched"]
+        )
+
+        assert [n.op_type for n in optimized_model.graph.node] == ["MatMul", "Add"]
+
+    def test_fuse_consecutive_mul_scalar(self):  # type: () -> None
+        c1 = numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="C1")
+        c2 = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "C1"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        graph = helper.make_graph(
+            [mul1, mul2],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (2, 3))],
+            initializer=[c1, c2],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_consecutive_mul", "eliminate_deadend"]
+        )
+
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Mul"
+        consts = {
+            init.name: to_array(init)
+            for init in optimized_model.graph.initializer
+        }
+        fused_name = optimized_model.graph.node[0].input[1]
+        np.testing.assert_allclose(consts[fused_name], 6.0)
+
+    def test_fuse_consecutive_mul_per_channel(self):  # type: () -> None
+        # per-channel (C,1,1) scale composed with a scalar factor (LayerScale)
+        c1 = numpy_helper.from_array(
+            np.arange(4, dtype=np.float32).reshape(4, 1, 1) + 1.0, name="C1"
+        )
+        c2 = numpy_helper.from_array(np.array(0.5, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "C1"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        graph = helper.make_graph(
+            [mul1, mul2],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 4, 2, 2))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 4, 2, 2))],
+            initializer=[c1, c2],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_consecutive_mul", "eliminate_deadend"]
+        )
+
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Mul"
+        consts = {
+            init.name: to_array(init)
+            for init in optimized_model.graph.initializer
+        }
+        fused_name = optimized_model.graph.node[0].input[1]
+        np.testing.assert_allclose(
+            consts[fused_name],
+            (np.arange(4, dtype=np.float32).reshape(4, 1, 1) + 1.0) * 0.5,
+        )
+
+    def test_fuse_consecutive_mul_inner_multiple_use_no_fuse(self):
+        c1 = numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="C1")
+        c2 = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "C1"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        ident = helper.make_node("Identity", ["Y"], ["Y2"])
+        graph = helper.make_graph(
+            [mul1, mul2, ident],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3))],
+            [
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (2, 3)),
+                helper.make_tensor_value_info("Y2", TensorProto.FLOAT, (2, 3)),
+            ],
+            initializer=[c1, c2],
+        )
+        optimized_model = self._optimized(graph, ["fuse_consecutive_mul"])
+
+        assert [n.op_type for n in optimized_model.graph.node].count("Mul") == 2
+
+    def test_fuse_consecutive_mul_nonconst_no_fuse(self):
+        # inner Mul has no constant operand -> nothing to fold
+        c2 = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "W"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        graph = helper.make_graph(
+            [mul1, mul2],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3)),
+                helper.make_tensor_value_info("W", TensorProto.FLOAT, (2, 3)),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (2, 3))],
+            initializer=[c2],
+        )
+        optimized_model = self._optimized(graph, ["fuse_consecutive_mul"])
+
+        assert [n.op_type for n in optimized_model.graph.node].count("Mul") == 2
+
     # type: () -> None
     def test_fuse_pad_into_conv_no_optional_value_opset10(self):
         pad = helper.make_node(
