@@ -50,6 +50,7 @@
 #include "onnxoptimizer/passes/fuse_consecutive_transposes.h"
 #include "onnxoptimizer/passes/fuse_matmul_add_bias_into_gemm.h"
 #include "onnxoptimizer/passes/fuse_matmul_add_bias_into_gemm_batched.h"
+#include "onnxoptimizer/passes/fuse_mul_into_conv.h"
 #include "onnxoptimizer/passes/fuse_pad_into_conv.h"
 #include "onnxoptimizer/passes/fuse_pad_into_pool.h"
 #include "onnxoptimizer/passes/fuse_transpose_into_gemm.h"
@@ -106,6 +107,7 @@ struct GlobalPassRegistry {
     registerPass<FuseConsecutiveMul>();
     registerPass<FuseMatMulAddBiasIntoGemm>();
     registerPass<FuseMatMulAddBiasIntoGemmBatched>();
+    registerPass<FuseMulIntoConv>();
     registerPass<FusePadIntoConv>();
     registerPass<FusePadIntoPool>();
     registerPass<FuseTransposeIntoGemm>();
