@@ -94,6 +94,18 @@ const std::vector<std::string> GetAvailablePasses();
 
 const std::vector<std::string> GetFuseAndEliminationPass();
 
+// Control whether the optimizer passes treat graph initializers as constant
+// tensors. The default (true) is onnxoptimizer's historical behaviour, in which
+// an initializer-backed value is a constant and value-baking passes
+// (fuse_bn_into_conv, fuse_add_bias_into_conv, nop-reshape/expand on a constant
+// shape, ...) may consume and fold it. When set to false, initializers are
+// treated as non-constant, so those passes leave initializer-backed values --
+// and the weights they represent -- untouched; Constant *nodes* are still
+// treated as constants. The setting is thread-local and stays in effect until
+// changed, so callers that flip it should restore it afterwards.
+void SetInitializersAsConstants(bool value);
+bool InitializersAsConstants();
+
 ModelProto Optimize(const ModelProto &mp_in,
                     const std::vector<std::string> &names);
 

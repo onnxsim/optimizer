@@ -1269,6 +1269,65 @@ class TestOptimizer(unittest.TestCase):
         assert len(optimized_model.graph.node[3].attribute[0].g.node) == 1
         assert optimized_model.graph.node[3].attribute[0].g.node[0].op_type == "Gemm"
 
+    def _conv_mul_graph(self, scale_shape, with_bias):
+        # Conv(X, W[, B]) -> Mul(., S), with constant W/B/S.
+        C_out, C_in, k = 4, 3, 3
+        W = np.random.rand(C_out, C_in, k, k).astype(np.float32)
+        S = np.random.rand(*scale_shape).astype(np.float32)
+        inits = [
+            numpy_helper.from_array(W, "W"),
+            numpy_helper.from_array(S, "S"),
+        ]
+        conv_inputs = ["X", "W"]
+        if with_bias:
+            B = np.random.rand(C_out).astype(np.float32)
+            inits.append(numpy_helper.from_array(B, "B"))
+            conv_inputs.append("B")
+        nodes = [
+            helper.make_node("Conv", conv_inputs, ["Z"], pads=[1, 1, 1, 1]),
+            helper.make_node("Mul", ["Z", "S"], ["Y"]),
+        ]
+        return helper.make_graph(
+            nodes,
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, C_in, 8, 8))],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, (1, C_out, 8, 8))],
+            initializer=inits,
+        )
+
+    def _conv_output_feeds_mul(self, model):
+        conv_outputs = {
+            o for n in model.graph.node if n.op_type == "Conv" for o in n.output
+        }
+        return any(
+            n.op_type == "Mul" and any(i in conv_outputs for i in n.input)
+            for n in model.graph.node
+        )
+
+    def test_fuse_mul_into_conv_per_channel(self):  # type: () -> None
+        # A per-output-channel scale (shape [1, C, 1, 1]) is folded into the Conv
+        # weights, so no Mul consumes the Conv output any more. _optimized also
+        # checks numerical equivalence via onnxruntime.
+        for with_bias in (True, False):
+            graph = self._conv_mul_graph((1, 4, 1, 1), with_bias)
+            optimized_model = self._optimized(graph, ["fuse_mul_into_conv"])
+            assert (
+                sum(n.op_type == "Conv" for n in optimized_model.graph.node) == 1
+            )
+            assert not self._conv_output_feeds_mul(optimized_model)
+
+    def test_fuse_mul_into_conv_scalar(self):  # type: () -> None
+        graph = self._conv_mul_graph((1,), True)
+        optimized_model = self._optimized(graph, ["fuse_mul_into_conv"])
+        assert not self._conv_output_feeds_mul(optimized_model)
+
+    def test_fuse_mul_into_conv_no_fuse_non_channel_scale(self):  # type: () -> None
+        # A per-pixel scale ([1, 1, H, W]) is not a per-channel scale and must not
+        # be folded into the weights.
+        graph = self._conv_mul_graph((1, 1, 8, 8), False)
+        optimized_model = self._optimized(graph, ["fuse_mul_into_conv"])
+        assert self._conv_output_feeds_mul(optimized_model)
+
     def test_fuse_add_bias_into_conv_with_scalar_bias(self):  # type: () -> None
         nodes = [
             helper.make_node("Conv", ["X", "Y"], ["Z"]),
@@ -1485,6 +1544,32 @@ class TestOptimizer(unittest.TestCase):
         assert optimized_model.graph.node[0].op_type == "Conv"
         assert optimized_model.graph.node[1].op_type == "Add"
 
+    def test_fuse_add_bias_into_conv_transpose_use_conv_shape(self):
+        # ConvTranspose weight is (in_ch, out_ch/group, kH, kW); the output
+        # channel count (M=16) must come from the output shape, not weight
+        # axis 0 (=in_ch=5).
+        conv = helper.make_node("ConvTranspose", ["X", "Y"], ["Z"])
+        add = helper.make_node("Add", ["Z", "A"], ["B"])
+        graph = helper.make_graph(
+            [conv, add],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
+                helper.make_tensor_value_info("Y", TensorProto.FLOAT, (5, 16, 3, 3)),
+                helper.make_tensor_value_info("A", TensorProto.FLOAT, (1, 16, 1, 1)),
+            ],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 5, 5))],
+            value_info=[
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 5, 5))
+            ],
+        )
+        optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
+
+        assert len(optimized_model.graph.node) == 2
+        assert optimized_model.graph.node[0].op_type == "Squeeze"
+        assert optimized_model.graph.node[1].op_type == "ConvTranspose"
+        assert len(optimized_model.graph.node[1].input) == 3
+
     def test_fuse_matmul_add_bias_into_gemm(self):  # type: () -> None
         matmul = helper.make_node("MatMul", ["X", "Y"], ["Z"])
         add = helper.make_node("Add", ["Z", "B"], ["A"])
@@ -1648,6 +1733,223 @@ class TestOptimizer(unittest.TestCase):
         optimized_model = self._optimized(graph, ["fuse_matmul_add_bias_into_gemm"])
 
         assert optimized_model.graph == graph
+
+    def test_fuse_matmul_add_bias_into_gemm_batched(self):  # type: () -> None
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4))],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 3, 5))],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_matmul_add_bias_into_gemm_batched", "eliminate_deadend"],
+        )
+
+        op_types = [n.op_type for n in optimized_model.graph.node]
+        assert op_types == ["Reshape", "Gemm", "Reshape"]
+        assert "MatMul" not in op_types
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_bias_first(self):
+        # Add is commutative; HuggingFace linear layers emit Add(bias, MatMul).
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["B", "Z"], ["A"])  # MatMul is 2nd operand
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4))],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 3, 5))],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_matmul_add_bias_into_gemm_batched", "eliminate_deadend"],
+        )
+        op_types = [n.op_type for n in optimized_model.graph.node]
+        assert op_types == ["Reshape", "Gemm", "Reshape"]
+        assert "MatMul" not in op_types
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_dynamic(self):
+        # dynamic leading dims -> Shape/Slice/Concat rebuild the output shape
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [
+                helper.make_tensor_value_info(
+                    "X", TensorProto.FLOAT, ("batch", "seq", 4)
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    "A", TensorProto.FLOAT, ("batch", "seq", 5)
+                )
+            ],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_matmul_add_bias_into_gemm_batched", "eliminate_deadend"],
+            compare_result=False,
+        )
+
+        op_types = [n.op_type for n in optimized_model.graph.node]
+        assert "Gemm" in op_types
+        assert "MatMul" not in op_types
+        assert op_types[-1] == "Reshape"
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_2d_no_fuse(self):
+        # rank-2 matmul is handled by the non-batched pass; this one must skip it
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (3, 4))],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (3, 5))],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_matmul_add_bias_into_gemm_batched"]
+        )
+
+        assert [n.op_type for n in optimized_model.graph.node] == ["MatMul", "Add"]
+
+    def test_fuse_matmul_add_bias_into_gemm_batched_nonconst_weight_no_fuse(self):
+        # W is a runtime input, not a constant -> cannot form a Gemm weight
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["Z", "B"], ["A"])
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4)),
+                helper.make_tensor_value_info("W", TensorProto.FLOAT, (4, 5)),
+            ],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 3, 5))],
+            initializer=[b],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_matmul_add_bias_into_gemm_batched"]
+        )
+
+        assert [n.op_type for n in optimized_model.graph.node] == ["MatMul", "Add"]
+
+    def test_fuse_consecutive_mul_scalar(self):  # type: () -> None
+        c1 = numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="C1")
+        c2 = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "C1"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        graph = helper.make_graph(
+            [mul1, mul2],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (2, 3))],
+            initializer=[c1, c2],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_consecutive_mul", "eliminate_deadend"]
+        )
+
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Mul"
+        consts = {
+            init.name: to_array(init)
+            for init in optimized_model.graph.initializer
+        }
+        fused_name = optimized_model.graph.node[0].input[1]
+        np.testing.assert_allclose(consts[fused_name], 6.0)
+
+    def test_fuse_consecutive_mul_per_channel(self):  # type: () -> None
+        # per-channel (C,1,1) scale composed with a scalar factor (LayerScale)
+        c1 = numpy_helper.from_array(
+            np.arange(4, dtype=np.float32).reshape(4, 1, 1) + 1.0, name="C1"
+        )
+        c2 = numpy_helper.from_array(np.array(0.5, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "C1"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        graph = helper.make_graph(
+            [mul1, mul2],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 4, 2, 2))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 4, 2, 2))],
+            initializer=[c1, c2],
+        )
+        optimized_model = self._optimized(
+            graph, ["fuse_consecutive_mul", "eliminate_deadend"]
+        )
+
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Mul"
+        consts = {
+            init.name: to_array(init)
+            for init in optimized_model.graph.initializer
+        }
+        fused_name = optimized_model.graph.node[0].input[1]
+        np.testing.assert_allclose(
+            consts[fused_name],
+            (np.arange(4, dtype=np.float32).reshape(4, 1, 1) + 1.0) * 0.5,
+        )
+
+    def test_fuse_consecutive_mul_inner_multiple_use_no_fuse(self):
+        c1 = numpy_helper.from_array(np.array(2.0, dtype=np.float32), name="C1")
+        c2 = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "C1"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        ident = helper.make_node("Identity", ["Y"], ["Y2"])
+        graph = helper.make_graph(
+            [mul1, mul2, ident],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3))],
+            [
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (2, 3)),
+                helper.make_tensor_value_info("Y2", TensorProto.FLOAT, (2, 3)),
+            ],
+            initializer=[c1, c2],
+        )
+        optimized_model = self._optimized(graph, ["fuse_consecutive_mul"])
+
+        assert [n.op_type for n in optimized_model.graph.node].count("Mul") == 2
+
+    def test_fuse_consecutive_mul_nonconst_no_fuse(self):
+        # inner Mul has no constant operand -> nothing to fold
+        c2 = numpy_helper.from_array(np.array(3.0, dtype=np.float32), name="C2")
+        mul1 = helper.make_node("Mul", ["X", "W"], ["Y"])
+        mul2 = helper.make_node("Mul", ["Y", "C2"], ["Z"])
+        graph = helper.make_graph(
+            [mul1, mul2],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3)),
+                helper.make_tensor_value_info("W", TensorProto.FLOAT, (2, 3)),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (2, 3))],
+            initializer=[c2],
+        )
+        optimized_model = self._optimized(graph, ["fuse_consecutive_mul"])
+
+        assert [n.op_type for n in optimized_model.graph.node].count("Mul") == 2
 
     # type: () -> None
     def test_fuse_pad_into_conv_no_optional_value_opset10(self):
@@ -2081,8 +2383,38 @@ class TestOptimizer(unittest.TestCase):
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [0, 0, 1, 1]
 
     def test_fuse_pad_into_maxpool_no_optional_value_opset10(self):
+        # A Pad with the default constant value (0) must NOT be folded into a
+        # MaxPool: MaxPool pads with -inf, so zero-padding changes the result.
+        # See https://github.com/onnxsim/onnxsim/issues/290
         pad = helper.make_node(
             "Pad", ["X"], ["P"], mode="constant", pads=[0, 0, 0, 0, 0, 0, 1, 1]
+        )
+        max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3, 3])
+        graph = helper.make_graph(
+            [pad, max_pool],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 2, 2))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 5, 1, 1))],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_pad_into_pool"],
+            False,
+            opset_imports=[helper.make_opsetid("", 10)],
+        )
+
+        assert optimized_model.graph == graph
+
+    def test_fuse_pad_into_maxpool_neg_inf_value_opset10(self):
+        # A Pad with constant value -inf is the correct fill value for MaxPool
+        # and can be folded into it.
+        pad = helper.make_node(
+            "Pad",
+            ["X"],
+            ["P"],
+            mode="constant",
+            pads=[0, 0, 0, 0, 0, 0, 1, 1],
+            value=float("-inf"),
         )
         max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3, 3])
         graph = helper.make_graph(
@@ -2133,6 +2465,9 @@ class TestOptimizer(unittest.TestCase):
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [0, 0, 1, 1]
 
     def test_fuse_pad_into_maxpool_no_optional_value(self):
+        # No constant_value input => Pad defaults to 0, which must NOT be folded
+        # into MaxPool (MaxPool pads with -inf).
+        # See https://github.com/onnxsim/onnxsim/issues/290
         pad = helper.make_node("Pad", ["X", "Pads"], ["P"], mode="constant")
         max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3, 3])
         graph = helper.make_graph(
@@ -2154,10 +2489,7 @@ class TestOptimizer(unittest.TestCase):
         )
         optimized_model = self._optimized(graph, ["fuse_pad_into_pool"])
 
-        assert len(list(optimized_model.graph.node)) == 1
-        assert optimized_model.graph.node[0].op_type == "MaxPool"
-        assert optimized_model.graph.node[0].attribute[1].name == "pads"
-        assert list(optimized_model.graph.node[0].attribute[1].ints) == [0, 0, 1, 1]
+        assert optimized_model.graph == graph
 
     def test_fuse_pad_into_avgpool_with_optional_value(self):
         pad = helper.make_node("Pad", ["X", "Pads", "Constant_value"], ["P"], mode="constant")
@@ -2196,7 +2528,10 @@ class TestOptimizer(unittest.TestCase):
         assert optimized_model.graph.node[0].attribute[2].name == "pads"
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [0, 0, 1, 1]
 
-    def test_fuse_pad_into_maxpool_with_optional_value(self):
+    def test_fuse_pad_into_maxpool_with_zero_optional_value(self):
+        # This is the exact case reported in
+        # https://github.com/onnxsim/onnxsim/issues/290 : a Pad with an explicit
+        # constant value of 0 must NOT be folded into a MaxPool.
         pad = helper.make_node("Pad", ["X", "Pads", "Constant_value"], ["P"], mode="constant")
         max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3, 3])
         graph = helper.make_graph(
@@ -2219,6 +2554,39 @@ class TestOptimizer(unittest.TestCase):
                     TensorProto.FLOAT,
                     dims=(),
                     vals=np.array([0]).astype(np.float32).tobytes(),
+                    raw=True,
+                ),
+            ],
+        )
+        optimized_model = self._optimized(graph, ["fuse_pad_into_pool"])
+
+        assert optimized_model.graph == graph
+
+    def test_fuse_pad_into_maxpool_with_neg_inf_optional_value(self):
+        # A Pad with constant value -inf is the correct fill value for MaxPool
+        # and can be folded into it.
+        pad = helper.make_node("Pad", ["X", "Pads", "Constant_value"], ["P"], mode="constant")
+        max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3, 3])
+        graph = helper.make_graph(
+            [pad, max_pool],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 2, 2)),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 5, 1, 1))],
+            [
+                helper.make_tensor(
+                    "Pads",
+                    TensorProto.INT64,
+                    dims=(8,),
+                    vals=np.array([0, 0, 0, 0, 0, 0, 1, 1]).astype(np.int64).tobytes(),
+                    raw=True,
+                ),
+                helper.make_tensor(
+                    "Constant_value",
+                    TensorProto.FLOAT,
+                    dims=(),
+                    vals=np.array([float("-inf")]).astype(np.float32).tobytes(),
                     raw=True,
                 ),
             ],
@@ -2317,7 +2685,29 @@ class TestOptimizer(unittest.TestCase):
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [1, 1]
 
     def test_fuse_pad_into_maxpool_1d_opset10(self):
+        # Default constant value (0) => must NOT fold into MaxPool.
         pad = helper.make_node("Pad", ["X"], ["P"], mode="constant", pads=[0, 0, 1, 0, 0, 1])
+        max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3])
+        graph = helper.make_graph(
+            [pad, max_pool],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 1))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 5, 1))],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_pad_into_pool"],
+            False,
+            opset_imports=[helper.make_opsetid("", 10)],
+        )
+
+        assert optimized_model.graph == graph
+
+    def test_fuse_pad_into_maxpool_1d_neg_inf_opset10(self):
+        pad = helper.make_node(
+            "Pad", ["X"], ["P"], mode="constant", pads=[0, 0, 1, 0, 0, 1],
+            value=float("-inf"),
+        )
         max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3])
         graph = helper.make_graph(
             [pad, max_pool],
@@ -2367,6 +2757,7 @@ class TestOptimizer(unittest.TestCase):
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [1, 1]
 
     def test_fuse_pad_into_maxpool_1d(self):
+        # No constant_value input => Pad defaults to 0 => must NOT fold.
         pad = helper.make_node("Pad", ["X", "Pads"], ["P"], mode="constant")
         max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3])
         graph = helper.make_graph(
@@ -2384,6 +2775,39 @@ class TestOptimizer(unittest.TestCase):
                     vals=np.array([0, 0, 1, 0, 0, 1]).astype(np.int64).tobytes(),
                     raw=True,
                 )
+            ],
+        )
+        optimized_model = self._optimized(graph, ["fuse_pad_into_pool"])
+
+        assert optimized_model.graph == graph
+
+    def test_fuse_pad_into_maxpool_1d_neg_inf(self):
+        pad = helper.make_node(
+            "Pad", ["X", "Pads", "Constant_value"], ["P"], mode="constant"
+        )
+        max_pool = helper.make_node("MaxPool", ["P"], ["Z"], kernel_shape=[3])
+        graph = helper.make_graph(
+            [pad, max_pool],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 1)),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 5, 1))],
+            [
+                helper.make_tensor(
+                    "Pads",
+                    TensorProto.INT64,
+                    dims=(6,),
+                    vals=np.array([0, 0, 1, 0, 0, 1]).astype(np.int64).tobytes(),
+                    raw=True,
+                ),
+                helper.make_tensor(
+                    "Constant_value",
+                    TensorProto.FLOAT,
+                    dims=(),
+                    vals=np.array([float("-inf")]).astype(np.float32).tobytes(),
+                    raw=True,
+                ),
             ],
         )
         optimized_model = self._optimized(graph, ["fuse_pad_into_pool"])
@@ -2424,8 +2848,32 @@ class TestOptimizer(unittest.TestCase):
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [1, 1, 1, 1]
 
     def test_fuse_pad_into_maxpool_existing_maxpool_pad_opset10(self):
+        # Default constant value (0) => must NOT fold into MaxPool.
         pad = helper.make_node(
             "Pad", ["X"], ["P"], mode="constant", pads=[0, 0, 0, 0, 0, 0, 1, 1]
+        )
+        max_pool = helper.make_node(
+            "MaxPool", ["P"], ["Z"], kernel_shape=[3, 3], pads=[1, 1, 0, 0]
+        )
+        graph = helper.make_graph(
+            [pad, max_pool],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 1, 1))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 5, 1, 1))],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_pad_into_pool"],
+            False,
+            opset_imports=[helper.make_opsetid("", 10)],
+        )
+
+        assert optimized_model.graph == graph
+
+    def test_fuse_pad_into_maxpool_existing_maxpool_pad_neg_inf_opset10(self):
+        pad = helper.make_node(
+            "Pad", ["X"], ["P"], mode="constant", pads=[0, 0, 0, 0, 0, 0, 1, 1],
+            value=float("-inf"),
         )
         max_pool = helper.make_node(
             "MaxPool", ["P"], ["Z"], kernel_shape=[3, 3], pads=[1, 1, 0, 0]
@@ -2483,6 +2931,7 @@ class TestOptimizer(unittest.TestCase):
         assert list(optimized_model.graph.node[0].attribute[2].ints) == [1, 1, 1, 1]
 
     def test_fuse_pad_into_maxpool_existing_maxpool_pad(self):
+        # No constant_value input => Pad defaults to 0 => must NOT fold.
         pad = helper.make_node("Pad", ["X", "Pads"], ["P"], mode="constant")
         max_pool = helper.make_node(
             "MaxPool", ["P"], ["Z"], kernel_shape=[3, 3], pads=[1, 1, 0, 0]
@@ -2502,6 +2951,41 @@ class TestOptimizer(unittest.TestCase):
                     vals=np.array([0, 0, 0, 0, 0, 0, 1, 1]).astype(np.int64).tobytes(),
                     raw=True,
                 )
+            ],
+        )
+        optimized_model = self._optimized(graph, ["fuse_pad_into_pool"])
+
+        assert optimized_model.graph == graph
+
+    def test_fuse_pad_into_maxpool_existing_maxpool_pad_neg_inf(self):
+        pad = helper.make_node(
+            "Pad", ["X", "Pads", "Constant_value"], ["P"], mode="constant"
+        )
+        max_pool = helper.make_node(
+            "MaxPool", ["P"], ["Z"], kernel_shape=[3, 3], pads=[1, 1, 0, 0]
+        )
+        graph = helper.make_graph(
+            [pad, max_pool],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 1, 1)),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 5, 1, 1))],
+            [
+                helper.make_tensor(
+                    "Pads",
+                    TensorProto.INT64,
+                    dims=(8,),
+                    vals=np.array([0, 0, 0, 0, 0, 0, 1, 1]).astype(np.int64).tobytes(),
+                    raw=True,
+                ),
+                helper.make_tensor(
+                    "Constant_value",
+                    TensorProto.FLOAT,
+                    dims=(),
+                    vals=np.array([float("-inf")]).astype(np.float32).tobytes(),
+                    raw=True,
+                ),
             ],
         )
         optimized_model = self._optimized(graph, ["fuse_pad_into_pool"])
@@ -3282,6 +3766,154 @@ class TestOptimizer(unittest.TestCase):
             )
             optimized_model = self._optimized(graph, ["fuse_bn_into_conv"])  # noqa
 
+    def test_fuse_bn_into_conv_transpose_simple(self):  # type: () -> None
+        for tensor_type, np_type in [(TensorProto.FLOAT, np.float32)]:
+            conv = helper.make_node(
+                "ConvTranspose", ["X", "W", "B"], ["Y"], strides=(2, 2)
+            )
+            bn = helper.make_node(
+                "BatchNormalization", ["Y", "scale", "b", "mean", "var"], ["Z"]
+            )
+
+            # ConvTranspose weight layout is (in_channels, out_channels, kH, kW),
+            # which is transposed relative to Conv's (out_channels, in_channels,
+            # kH, kW). Use distinct in/out channel counts so the fusion exercises
+            # the correct (out-channel) axis instead of accidentally passing when
+            # in_channels == out_channels.
+            in_channels, out_channels = 4, 6
+            W = np.random.randn(in_channels, out_channels, 2, 2).astype(np_type) + 2
+            B = (
+                np.random.randn(
+                    out_channels,
+                ).astype(np_type)
+                + 2
+            )
+            scale = (
+                np.random.randn(
+                    out_channels,
+                ).astype(np_type)
+                + 2
+            )
+            b = (
+                np.random.randn(
+                    out_channels,
+                ).astype(np_type)
+                + 2
+            )
+            mean = (
+                np.random.randn(
+                    out_channels,
+                ).astype(np_type)
+                + 2
+            )
+            var = (
+                np.abs(
+                    np.random.randn(
+                        out_channels,
+                    ).astype(np_type)
+                )
+                + 2
+            )
+
+            initializers = [
+                helper.make_tensor(name, tensor_type, npa.shape, npa.tobytes(), raw=True)
+                for name, npa in [
+                    ("W", W),
+                    ("B", B),
+                    ("scale", scale),
+                    ("b", b),
+                    ("mean", mean),
+                    ("var", var),
+                ]
+            ]
+            graph = helper.make_graph(
+                [conv, bn],
+                "test",
+                [helper.make_tensor_value_info("X", tensor_type, (1, in_channels, 8, 8))],
+                [helper.make_tensor_value_info("Z", tensor_type, (1, out_channels, 16, 16))],
+                initializer=initializers,
+                value_info=[
+                    helper.make_tensor_value_info(
+                        "Y", tensor_type, (1, out_channels, 16, 16)
+                    )
+                ],
+            )
+            optimized_model = self._optimized(graph, ["fuse_bn_into_conv"])
+
+            # The BatchNormalization node must be fused away.
+            assert all(
+                node.op_type != "BatchNormalization"
+                for node in optimized_model.graph.node
+            )
+
+    def _make_conv_bn_model(self):  # type: () -> ModelProto
+        tensor_type, np_type = TensorProto.FLOAT, np.float32
+        conv = helper.make_node("Conv", ["X", "W", "B"], ["Y"])
+        bn = helper.make_node(
+            "BatchNormalization", ["Y", "scale", "b", "mean", "var"], ["Z"]
+        )
+        W = np.random.randn(3, 2, 5, 5).astype(np_type) + 2
+        B = np.random.randn(3).astype(np_type) + 2
+        scale = np.random.randn(3).astype(np_type) + 2
+        b = np.random.randn(3).astype(np_type) + 2
+        mean = np.random.randn(3).astype(np_type) + 2
+        var = np.abs(np.random.randn(3).astype(np_type)) + 2
+        initializers = [
+            helper.make_tensor(name, tensor_type, npa.shape, npa.tobytes(), raw=True)
+            for name, npa in [
+                ("W", W),
+                ("B", B),
+                ("scale", scale),
+                ("b", b),
+                ("mean", mean),
+                ("var", var),
+            ]
+        ]
+        graph = helper.make_graph(
+            [conv, bn],
+            "test",
+            [helper.make_tensor_value_info("X", tensor_type, (5, 2, 28, 28))],
+            [helper.make_tensor_value_info("Z", tensor_type, (5, 3, 24, 24))],
+            initializer=initializers,
+            value_info=[
+                helper.make_tensor_value_info("Y", tensor_type, (5, 3, 24, 24))
+            ],
+        )
+        return helper.make_model(
+            graph,
+            producer_name="onnx-test",
+            opset_imports=[helper.make_opsetid("", LATEST_STABLE_OPSET_VERSION)],
+            ir_version=10,
+        )
+
+    def test_fuse_bn_into_conv_default_treats_initializers_as_constants(self):
+        # With the default behaviour the BatchNormalization initializers are
+        # constants, so fuse_bn_into_conv folds the BN into the Conv weights.
+        model = self._make_conv_bn_model()
+        optimized = onnxoptimizer.optimize(model, ["fuse_bn_into_conv"])
+        op_types = [n.op_type for n in optimized.graph.node]
+        assert "BatchNormalization" not in op_types
+
+    def test_initializers_as_non_constants_disables_fuse_bn(self):
+        # Treating initializers as non-constant leaves the BN weights alone, so
+        # the pass cannot fold BatchNormalization into the Conv.
+        model = self._make_conv_bn_model()
+        optimized = onnxoptimizer.optimize(
+            model, ["fuse_bn_into_conv"], initializers_as_constants=False
+        )
+        op_types = [n.op_type for n in optimized.graph.node]
+        assert "BatchNormalization" in op_types
+        assert "Conv" in op_types
+
+    def test_initializers_as_constants_flag_is_restored(self):
+        # onnxoptimizer.optimize must not leak the thread-local switch it sets.
+        assert onnxoptimizer.onnx_opt_cpp2py_export.initializers_as_constants()
+        model = self._make_conv_bn_model()
+        onnxoptimizer.optimize(
+            model, ["fuse_bn_into_conv"], initializers_as_constants=False
+        )
+        assert onnxoptimizer.onnx_opt_cpp2py_export.initializers_as_constants()
+
     def _internal_test_deadend_elimination(self, fixed):  # type: (bool) -> None
         softmax = helper.make_node("Softmax", ["X"], ["Y"], axis=2)
         log = helper.make_node("Log", ["Y"], ["Z"])
@@ -3515,9 +4147,84 @@ class TestOptimizer(unittest.TestCase):
         )
         optimized_model = self._optimized(graph, ["eliminate_nop_dropout"], False)
 
-        # we don't want to eliminate the dropoutin opset 12,
-        # even when it';s an optional parameter (defaults to 0)
-        assert optimized_model.graph == graph
+        # In opset 12+ ratio and training_mode are optional inputs; both are
+        # omitted here, so training_mode defaults to false (inference) and the
+        # Dropout is a pure no-op. It should be eliminated, matching onnxslim.
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Log"
+
+    def test_eliminate_nop_dropout_opset12_const_ratio_zero(self):
+        # ratio provided as a constant-0 initializer, training_mode omitted.
+        ratio = helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.0])
+        node = helper.make_node("Dropout", ["X", "ratio"], ["Y"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        graph = helper.make_graph(
+            [node, node1],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7))],
+            initializer=[ratio],
+        )
+        optimized_model = self._optimized(graph, ["eliminate_nop_dropout"], False)
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Log"
+
+    def test_eliminate_nop_dropout_opset12_nonzero_ratio_kept(self):
+        # A nonzero constant ratio is not the documented no-op; keep it.
+        ratio = helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.5])
+        node = helper.make_node("Dropout", ["X", "ratio"], ["Y"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        graph = helper.make_graph(
+            [node, node1],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7))],
+            initializer=[ratio],
+        )
+        optimized_model = self._optimized(graph, ["eliminate_nop_dropout"], False)
+        assert len(optimized_model.graph.node) == 2
+        assert optimized_model.graph.node[0].op_type == "Dropout"
+
+    def test_eliminate_nop_dropout_opset12_training_mode_input_kept(self):
+        # training_mode is a runtime graph input (not a constant), so the
+        # Dropout may run in training mode: it must be preserved.
+        node = helper.make_node("Dropout", ["X", "ratio", "training_mode"], ["Y"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        ratio = helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.0])
+        graph = helper.make_graph(
+            [node, node1],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7)),
+                helper.make_tensor_value_info("training_mode", TensorProto.BOOL, []),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7))],
+            initializer=[ratio],
+        )
+        optimized_model = self._optimized(
+            graph, ["eliminate_nop_dropout"], False, compare_result=False
+        )
+        assert len(optimized_model.graph.node) == 2
+        assert optimized_model.graph.node[0].op_type == "Dropout"
+
+    def test_eliminate_nop_dropout_mask_used_kept(self):
+        # The mask (second) output is consumed, so the node cannot be dropped.
+        node = helper.make_node("Dropout", ["X"], ["Y", "mask"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        node2 = helper.make_node("Identity", ["mask"], ["M"])
+        graph = helper.make_graph(
+            [node, node1, node2],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7))],
+            [
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7)),
+                helper.make_tensor_value_info("M", TensorProto.BOOL, (5, 7)),
+            ],
+        )
+        optimized_model = self._optimized(
+            graph, ["eliminate_nop_dropout"], False, compare_result=False
+        )
+        assert any(n.op_type == "Dropout" for n in optimized_model.graph.node)
 
     # type: () -> None
     def test_eliminate_nop_dropout_opset11_graph_output(self):
@@ -4976,6 +5683,54 @@ class TestOptimizer(unittest.TestCase):
         assert len(optimized_model.graph.node) == 1
         assert optimized_model.graph.node[0].op_type == "Unsqueeze"
 
+    def test_fuse_consecutive_unsqueezes_unknown_input_shape(self):
+        # Consecutive Unsqueezes with non-negative axes fuse even when the inner
+        # Unsqueeze's input has no static shape -- the pattern detection models
+        # feed into NonMaxSuppression as Unsqueeze(Unsqueeze(scalar)). The rank
+        # is only needed to normalize negative axes, so a missing shape must not
+        # block the fusion here.
+        x = helper.make_tensor_value_info("X", TensorProto.FLOAT, None)
+        z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, None)
+        nodes = [
+            helper.make_node("Unsqueeze", ["X"], ["S1"], axes=[0]),
+            helper.make_node("Unsqueeze", ["S1"], ["Z"], axes=[0]),
+        ]
+        graph = helper.make_graph(nodes, "test", [x], [z])
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_consecutive_unsqueezes", "eliminate_deadend"],
+            False,
+            opset_imports=[helper.make_opsetid("", 11)],
+            compare_result=False,
+            check=False,
+        )
+        unsq = [n for n in optimized_model.graph.node if n.op_type == "Unsqueeze"]
+        assert len(unsq) == 1
+        assert sorted(unsq[0].attribute[0].ints) == [0, 1]
+
+    def test_fuse_consecutive_unsqueezes_unknown_shape_negative_axis_kept(self):
+        # With an unknown input shape a negative axis cannot be normalized, so
+        # the fusion must decline rather than miscompute the merged axes.
+        x = helper.make_tensor_value_info("X", TensorProto.FLOAT, None)
+        z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, None)
+        nodes = [
+            helper.make_node("Unsqueeze", ["X"], ["S1"], axes=[0]),
+            helper.make_node("Unsqueeze", ["S1"], ["Z"], axes=[-1]),
+        ]
+        graph = helper.make_graph(nodes, "test", [x], [z])
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_consecutive_unsqueezes", "eliminate_deadend"],
+            False,
+            opset_imports=[helper.make_opsetid("", 11)],
+            compare_result=False,
+            check=False,
+        )
+        assert (
+            len([n for n in optimized_model.graph.node if n.op_type == "Unsqueeze"])
+            == 2
+        )
+
     def test_eliminate_consecutive_idempotent_op(self):
         model = parser.parse_model("""
                 <
@@ -5045,6 +5800,106 @@ class TestOptimizer(unittest.TestCase):
         assert {i.op_type for i in optimized_model.graph.node} == {"Where", "And", "Sign"}
         assert optimized_model.graph.node[0].input == ["A", "Y", "X"]
         assert optimized_model.graph.node[3].input == ["M", "X", "Y"]
+
+    @staticmethod
+    def _make_function_model():
+        # Build a model that contains a model-local function directly with
+        # onnx.helper (no torch dependency). The main graph has a redundant
+        # Identity node so the optimizer has something to do, while the
+        # function itself should be carried over untouched.
+        func = helper.make_function(
+            domain="custom",
+            fname="CustomRelu",
+            inputs=["x"],
+            outputs=["y"],
+            nodes=[
+                helper.make_node("Relu", ["x"], ["t"]),
+                helper.make_node("Add", ["t", "t"], ["y"]),
+            ],
+            opset_imports=[helper.make_opsetid("", LATEST_STABLE_OPSET_VERSION)],
+        )
+
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [4])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4])
+        graph = helper.make_graph(
+            [
+                helper.make_node("Identity", ["X"], ["X_id"]),
+                helper.make_node("CustomRelu", ["X_id"], ["Y"], domain="custom"),
+            ],
+            "function_graph",
+            [X],
+            [Y],
+        )
+        model = helper.make_model(
+            graph,
+            producer_name="onnx-test",
+            functions=[func],
+            opset_imports=[
+                helper.make_opsetid("", LATEST_STABLE_OPSET_VERSION),
+                helper.make_opsetid("custom", 1),
+            ],
+            ir_version=10,
+        )
+        checker.check_model(model)
+        return model
+
+    def test_preserve_functions(self):  # type: () -> None
+        model = self._make_function_model()
+        assert len(model.functions) == 1
+
+        optimized_model = self._optimized(
+            model, ["eliminate_identity", "eliminate_deadend"], True
+        )
+
+        # The optimizer must not drop model-local functions.
+        assert len(optimized_model.functions) == len(model.functions)
+        opt_func = optimized_model.functions[0]
+        assert opt_func.name == "CustomRelu"
+        assert opt_func.domain == "custom"
+        # The function body is left as-is.
+        assert [n.op_type for n in opt_func.node] == ["Relu", "Add"]
+        # The redundant Identity in the main graph is eliminated, and the call
+        # to the function is preserved.
+        assert [n.op_type for n in optimized_model.graph.node] == ["CustomRelu"]
+        assert optimized_model.graph.node[0].domain == "custom"
+
+    def test_preserve_multiple_functions_from_parser(self):  # type: () -> None
+        # The onnx text parser is an equally valid way to spell out functions.
+        model = parser.parse_model("""
+                <
+                    ir_version: 10,
+                    opset_import: ["": 13, "custom": 1]
+                >
+                agraph (float[4] X) => (float[4] Y)
+                {
+                    T = custom.FnA(X)
+                    Y = custom.FnB(T)
+                }
+                <
+                    domain: "custom",
+                    opset_import: ["": 13]
+                >
+                FnA (x) => (y)
+                {
+                    y = Relu(x)
+                }
+                <
+                    domain: "custom",
+                    opset_import: ["": 13]
+                >
+                FnB (x) => (y)
+                {
+                    y = Neg(x)
+                }
+            """)
+        assert len(model.functions) == 2
+
+        optimized_model = self._optimized(
+            model, ["eliminate_deadend"], True, compare_result=False
+        )
+
+        assert len(optimized_model.functions) == 2
+        assert {f.name for f in optimized_model.functions} == {"FnA", "FnB"}
 
 
 if __name__ == "__main__":
