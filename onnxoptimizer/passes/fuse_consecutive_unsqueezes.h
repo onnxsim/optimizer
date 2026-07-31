@@ -25,8 +25,7 @@ struct FuseConsecutiveUnsqueezes final : public PredicateBasedPass {
   }
 
   bool patternMatchPredicate(Node* node) override {
-    return CheckKind(node, kUnsqueeze, 0, kUnsqueeze) &&
-           GetInputsOfPreNode(node, 0)[0]->has_sizes();
+    return CheckKind(node, kUnsqueeze, 0, kUnsqueeze);
   }
 
   bool runTransform(Node* n, Graph& graph,
@@ -38,6 +37,22 @@ struct FuseConsecutiveUnsqueezes final : public PredicateBasedPass {
     if (!GetValueFromAttrOrInput(n, kaxes, 1, axes) ||
         !GetValueFromAttrOrInput(prev, kaxes, 1, axes_of_prev)) {
       return false;
+    }
+    // The rank of prev's input is only needed to normalize *negative* axes.
+    // When that shape is unknown we can still fuse as long as every axis is
+    // already non-negative -- common on dynamic-shape graphs where, e.g.,
+    // detection models feed NonMaxSuppression through Unsqueeze(Unsqueeze(x))
+    // chains whose scalar input has no static shape. Bail only if a negative
+    // axis would need a rank we don't have.
+    if (!prev->input(0)->has_sizes()) {
+      for (int64_t a : axes_of_prev) {
+        if (a < 0)
+          return false;
+      }
+      for (int64_t a : axes) {
+        if (a < 0)
+          return false;
+      }
     }
     const auto dims = prev->input(0)->sizes();
     for (auto& axis : axes_of_prev) {

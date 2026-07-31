@@ -5660,6 +5660,54 @@ class TestOptimizer(unittest.TestCase):
         assert len(optimized_model.graph.node) == 1
         assert optimized_model.graph.node[0].op_type == "Unsqueeze"
 
+    def test_fuse_consecutive_unsqueezes_unknown_input_shape(self):
+        # Consecutive Unsqueezes with non-negative axes fuse even when the inner
+        # Unsqueeze's input has no static shape -- the pattern detection models
+        # feed into NonMaxSuppression as Unsqueeze(Unsqueeze(scalar)). The rank
+        # is only needed to normalize negative axes, so a missing shape must not
+        # block the fusion here.
+        x = helper.make_tensor_value_info("X", TensorProto.FLOAT, None)
+        z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, None)
+        nodes = [
+            helper.make_node("Unsqueeze", ["X"], ["S1"], axes=[0]),
+            helper.make_node("Unsqueeze", ["S1"], ["Z"], axes=[0]),
+        ]
+        graph = helper.make_graph(nodes, "test", [x], [z])
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_consecutive_unsqueezes", "eliminate_deadend"],
+            False,
+            opset_imports=[helper.make_opsetid("", 11)],
+            compare_result=False,
+            check=False,
+        )
+        unsq = [n for n in optimized_model.graph.node if n.op_type == "Unsqueeze"]
+        assert len(unsq) == 1
+        assert sorted(unsq[0].attribute[0].ints) == [0, 1]
+
+    def test_fuse_consecutive_unsqueezes_unknown_shape_negative_axis_kept(self):
+        # With an unknown input shape a negative axis cannot be normalized, so
+        # the fusion must decline rather than miscompute the merged axes.
+        x = helper.make_tensor_value_info("X", TensorProto.FLOAT, None)
+        z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, None)
+        nodes = [
+            helper.make_node("Unsqueeze", ["X"], ["S1"], axes=[0]),
+            helper.make_node("Unsqueeze", ["S1"], ["Z"], axes=[-1]),
+        ]
+        graph = helper.make_graph(nodes, "test", [x], [z])
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_consecutive_unsqueezes", "eliminate_deadend"],
+            False,
+            opset_imports=[helper.make_opsetid("", 11)],
+            compare_result=False,
+            check=False,
+        )
+        assert (
+            len([n for n in optimized_model.graph.node if n.op_type == "Unsqueeze"])
+            == 2
+        )
+
     def test_eliminate_consecutive_idempotent_op(self):
         model = parser.parse_model("""
                 <
