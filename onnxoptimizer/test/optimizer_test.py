@@ -1757,6 +1757,29 @@ class TestOptimizer(unittest.TestCase):
         assert op_types == ["Reshape", "Gemm", "Reshape"]
         assert "MatMul" not in op_types
 
+    def test_fuse_matmul_add_bias_into_gemm_batched_bias_first(self):
+        # Add is commutative; HuggingFace linear layers emit Add(bias, MatMul).
+        matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
+        add = helper.make_node("Add", ["B", "Z"], ["A"])  # MatMul is 2nd operand
+        w = numpy_helper.from_array(
+            np.random.randn(4, 5).astype(np.float32), name="W"
+        )
+        b = numpy_helper.from_array(np.random.randn(5).astype(np.float32), name="B")
+        graph = helper.make_graph(
+            [matmul, add],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4))],
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 3, 5))],
+            initializer=[w, b],
+        )
+        optimized_model = self._optimized(
+            graph,
+            ["fuse_matmul_add_bias_into_gemm_batched", "eliminate_deadend"],
+        )
+        op_types = [n.op_type for n in optimized_model.graph.node]
+        assert op_types == ["Reshape", "Gemm", "Reshape"]
+        assert "MatMul" not in op_types
+
     def test_fuse_matmul_add_bias_into_gemm_batched_dynamic(self):
         # dynamic leading dims -> Shape/Slice/Concat rebuild the output shape
         matmul = helper.make_node("MatMul", ["X", "W"], ["Z"])
