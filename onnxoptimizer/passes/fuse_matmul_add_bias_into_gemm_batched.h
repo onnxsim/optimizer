@@ -52,15 +52,28 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     return graph.addInitializerAndCreateValue(t);
   }
 
+  // Add is commutative, so the MatMul may be either operand. Exporters differ:
+  // HuggingFace linear layers emit ``Add(bias, MatMul(x, W))`` (MatMul second).
+  // Return the operand index feeding the fusible MatMul, or -1.
+  static int MatMulOperandIndex(Node* node) {
+    if (node->kind() != kAdd || node->inputs().size() != 2) {
+      return -1;
+    }
+    for (int i = 0; i < 2; ++i) {
+      if (CheckKind(node->input(i), kMatMul) &&
+          node->input(i)->uses().size() == 1) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
   bool patternMatchPredicate(Node* node) override {
-    if (!CheckKind(node, kAdd, 0, kMatMul)) {
+    const int mm_idx = MatMulOperandIndex(node);
+    if (mm_idx < 0) {
       return false;
     }
-    Value* matmul_out = node->input(0);
-    // MatMul result must feed only this Add.
-    if (matmul_out->uses().size() > 1) {
-      return false;
-    }
+    Value* matmul_out = node->input(mm_idx);
     Node* matmul = matmul_out->node();
     Value* x = matmul->input(0);
     Value* w = matmul->input(1);
@@ -89,7 +102,7 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
     const int64_t n = w_shape[1].dim;
 
     // bias: 1-D, broadcastable over the N axis only ([N] or [1]).
-    Value* bias = node->input(1);
+    Value* bias = node->input(1 - mm_idx);
     if (!bias->has_sizes()) {
       return false;
     }
@@ -119,10 +132,11 @@ struct FuseMatMulAddBiasIntoGemmBatched final : public PredicateBasedPass {
                     NodeDestroyType& destroy_current) override {
     destroy_current = NodeDestroyType::DestroyZero;
 
-    Node* matmul = n->input(0)->node();
+    const int mm_idx = MatMulOperandIndex(n);
+    Node* matmul = n->input(mm_idx)->node();
     Value* x = matmul->input(0);
     Value* w = matmul->input(1);
-    Value* bias = n->input(1);
+    Value* bias = n->input(1 - mm_idx);
 
     const auto& x_shape = x->sizes();
     const int64_t rank = static_cast<int64_t>(x_shape.size());
