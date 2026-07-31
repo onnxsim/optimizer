@@ -1544,6 +1544,32 @@ class TestOptimizer(unittest.TestCase):
         assert optimized_model.graph.node[0].op_type == "Conv"
         assert optimized_model.graph.node[1].op_type == "Add"
 
+    def test_fuse_add_bias_into_conv_transpose_use_conv_shape(self):
+        # ConvTranspose weight is (in_ch, out_ch/group, kH, kW); the output
+        # channel count (M=16) must come from the output shape, not weight
+        # axis 0 (=in_ch=5).
+        conv = helper.make_node("ConvTranspose", ["X", "Y"], ["Z"])
+        add = helper.make_node("Add", ["Z", "A"], ["B"])
+        graph = helper.make_graph(
+            [conv, add],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
+                helper.make_tensor_value_info("Y", TensorProto.FLOAT, (5, 16, 3, 3)),
+                helper.make_tensor_value_info("A", TensorProto.FLOAT, (1, 16, 1, 1)),
+            ],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 5, 5))],
+            value_info=[
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 5, 5))
+            ],
+        )
+        optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
+
+        assert len(optimized_model.graph.node) == 2
+        assert optimized_model.graph.node[0].op_type == "Squeeze"
+        assert optimized_model.graph.node[1].op_type == "ConvTranspose"
+        assert len(optimized_model.graph.node[1].input) == 3
+
     def test_fuse_matmul_add_bias_into_gemm(self):  # type: () -> None
         matmul = helper.make_node("MatMul", ["X", "Y"], ["Z"])
         add = helper.make_node("Add", ["Z", "B"], ["A"])
@@ -4098,9 +4124,84 @@ class TestOptimizer(unittest.TestCase):
         )
         optimized_model = self._optimized(graph, ["eliminate_nop_dropout"], False)
 
-        # we don't want to eliminate the dropoutin opset 12,
-        # even when it';s an optional parameter (defaults to 0)
-        assert optimized_model.graph == graph
+        # In opset 12+ ratio and training_mode are optional inputs; both are
+        # omitted here, so training_mode defaults to false (inference) and the
+        # Dropout is a pure no-op. It should be eliminated, matching onnxslim.
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Log"
+
+    def test_eliminate_nop_dropout_opset12_const_ratio_zero(self):
+        # ratio provided as a constant-0 initializer, training_mode omitted.
+        ratio = helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.0])
+        node = helper.make_node("Dropout", ["X", "ratio"], ["Y"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        graph = helper.make_graph(
+            [node, node1],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7))],
+            initializer=[ratio],
+        )
+        optimized_model = self._optimized(graph, ["eliminate_nop_dropout"], False)
+        assert len(optimized_model.graph.node) == 1
+        assert optimized_model.graph.node[0].op_type == "Log"
+
+    def test_eliminate_nop_dropout_opset12_nonzero_ratio_kept(self):
+        # A nonzero constant ratio is not the documented no-op; keep it.
+        ratio = helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.5])
+        node = helper.make_node("Dropout", ["X", "ratio"], ["Y"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        graph = helper.make_graph(
+            [node, node1],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7))],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7))],
+            initializer=[ratio],
+        )
+        optimized_model = self._optimized(graph, ["eliminate_nop_dropout"], False)
+        assert len(optimized_model.graph.node) == 2
+        assert optimized_model.graph.node[0].op_type == "Dropout"
+
+    def test_eliminate_nop_dropout_opset12_training_mode_input_kept(self):
+        # training_mode is a runtime graph input (not a constant), so the
+        # Dropout may run in training mode: it must be preserved.
+        node = helper.make_node("Dropout", ["X", "ratio", "training_mode"], ["Y"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        ratio = helper.make_tensor("ratio", TensorProto.FLOAT, [], [0.0])
+        graph = helper.make_graph(
+            [node, node1],
+            "test",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7)),
+                helper.make_tensor_value_info("training_mode", TensorProto.BOOL, []),
+            ],
+            [helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7))],
+            initializer=[ratio],
+        )
+        optimized_model = self._optimized(
+            graph, ["eliminate_nop_dropout"], False, compare_result=False
+        )
+        assert len(optimized_model.graph.node) == 2
+        assert optimized_model.graph.node[0].op_type == "Dropout"
+
+    def test_eliminate_nop_dropout_mask_used_kept(self):
+        # The mask (second) output is consumed, so the node cannot be dropped.
+        node = helper.make_node("Dropout", ["X"], ["Y", "mask"])
+        node1 = helper.make_node("Log", ["Y"], ["Z"])
+        node2 = helper.make_node("Identity", ["mask"], ["M"])
+        graph = helper.make_graph(
+            [node, node1, node2],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (5, 7))],
+            [
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (5, 7)),
+                helper.make_tensor_value_info("M", TensorProto.BOOL, (5, 7)),
+            ],
+        )
+        optimized_model = self._optimized(
+            graph, ["eliminate_nop_dropout"], False, compare_result=False
+        )
+        assert any(n.op_type == "Dropout" for n in optimized_model.graph.node)
 
     # type: () -> None
     def test_eliminate_nop_dropout_opset11_graph_output(self):
