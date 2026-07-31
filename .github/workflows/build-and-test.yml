@@ -45,8 +45,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, windows-11-arm, macos-15]        
-        python: ["cp314t", "cp312", "cp311", "cp310"] # because of abi3 we don't need to build separate whls for python 3.13, 3.14
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, windows-11-arm, macos-15]
+        # because of abi3 we don't need to build separate whls for python 3.13, 3.14.
+        # Full coverage on push/release; a reduced set on pull_request to cut CI
+        # jobs. cp310 exercises a version-specific (below-abi3-floor) wheel, cp312
+        # the abi3 wheel that also serves 3.13/3.14, and cp314t the free-threaded
+        # build, so cp311 adds no distinct build coverage on PRs.
+        python: ${{ github.event_name == 'pull_request' && fromJSON('["cp314t", "cp312", "cp310"]') || fromJSON('["cp314t", "cp312", "cp311", "cp310"]') }}
     steps:
     - uses: actions/checkout@v7.0.0
       with:
