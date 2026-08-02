@@ -31,6 +31,7 @@
 #include "onnxoptimizer/passes/eliminate_nop_monotone_argmax.h"
 #include "onnxoptimizer/passes/eliminate_nop_pad.h"
 #include "onnxoptimizer/passes/eliminate_nop_reshape.h"
+#include "onnxoptimizer/passes/eliminate_reshape_around_elementwise.h"
 #include "onnxoptimizer/passes/eliminate_nop_split.h"
 #include "onnxoptimizer/passes/eliminate_nop_transpose.h"
 #include "onnxoptimizer/passes/eliminate_shape_gather.h"
@@ -113,6 +114,7 @@ struct GlobalPassRegistry {
     registerPass<SplitPredict>();
     registerPass<FuseConcatIntoReshape>();
     registerPass<EliminateNopReshape>();
+    registerPass<EliminateReshapeAroundElementwise>();
     registerPass<EliminateOpWithUnit>();
     registerPass<EliminateCommonSubexpression>();
     registerPass<FuseQKV>();
