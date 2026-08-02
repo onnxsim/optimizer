@@ -36,8 +36,8 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
-# `--durations=10` reports the 10 slowest tests; the root conftest.py also
-# mirrors that list into the GitHub Actions job summary when running in CI.
+# `--durations=10` reports the 10 slowest tests; onnxoptimizer/test/conftest.py
+# also mirrors that list into the GitHub Actions job summary when running in CI.
 addopts = "-n auto --durations=10"
 testpaths = [
   "onnxoptimizer/test/"

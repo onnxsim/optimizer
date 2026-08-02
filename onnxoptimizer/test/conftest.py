@@ -1,9 +1,16 @@
-"""Project-wide pytest configuration.
+"""Pytest configuration for the test suite.
 
 The ``--durations=10`` flag (set as a default in ``pyproject.toml``) makes pytest
 print the slowest tests to the terminal. When the suite runs on GitHub Actions we
 also mirror that list into the job's step summary, so the timings show up on the
 run's summary page instead of being buried in the raw logs.
+
+This file lives in ``onnxoptimizer/test/`` rather than the repo root on purpose:
+pytest's default ``prepend`` import mode inserts a conftest's directory onto
+``sys.path``. A root conftest would put the repo root there, so ``import
+onnxoptimizer`` would resolve to the source tree (which has no compiled C++
+extension) and shadow the installed wheel during ``cibuildwheel`` tests. Keeping
+it under the test directory imports the installed package unchanged.
 """
 
 import os
