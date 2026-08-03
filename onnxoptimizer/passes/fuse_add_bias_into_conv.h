@@ -8,21 +8,14 @@
 #pragma once
 
 // Before:
-//   Z = Conv(X, Y)          (or ConvTranspose(X, Y))
+//   Z = Conv(X, Y)
 //   B = Z + A
 // After:
-//   B = Conv(X, Y, A)       (or ConvTranspose(X, Y, A))
+//   B = Conv(X, Y, A)
 //
 // the pass can handle the following cases:
 //   case 1: A is 1D tensor and A.dim[0] == Z.dim[1]
 //   case 2: A is 1-element 1D tensor
-//
-// The bias input has identical semantics for Conv and ConvTranspose (a 1D
-// tensor of length = output channels, added along the output channel axis), so
-// the same rewrite applies. The only wrinkle is that a ConvTranspose weight is
-// laid out (in_ch, out_ch/group, k...), so its axis 0 is *not* the output
-// channel count -- the output channel count M is taken from the Add/Conv output
-// shape instead, and the weight-axis-0 shortcut is skipped for ConvTranspose.
 
 #include <numeric>
 
@@ -41,8 +34,7 @@ struct FuseAddBiasIntoConv final : public PredicateBasedPass {
     return "fuse_add_bias_into_conv";
   }
   bool patternMatchPredicate(Node *node) override {
-    return (CheckKind(node, kAdd, 0, kConv) ||
-            CheckKind(node, kAdd, 0, kConvTranspose)) &&
+    return CheckKind(node, kAdd, 0, kConv) &&
            GetInputsOfPreNode(node, 0).size() == 2;
   }
   static Node *makeSqueezeOrUnsqueeze(Graph &graph, std::vector<int64_t> &axes,
@@ -82,12 +74,6 @@ struct FuseAddBiasIntoConv final : public PredicateBasedPass {
     if (orig_conv->uses().size() > 1) {
       return false;
     }
-    // A ConvTranspose weight is (in_ch, out_ch/group, k...), so its axis 0 is
-    // the input channel count, not the output channel count M that the bias is
-    // sized by. For ConvTranspose we therefore take M solely from the output
-    // shape and skip the weight-axis-0 shortcut below (which would otherwise
-    // mis-set M and trip the equality assertion).
-    const bool is_transpose = orig_conv->node()->kind() == kConvTranspose;
     auto conv_shape = orig_conv->sizes();
     auto bias_shape = orig_bias->sizes();
     auto weight_shape = orig_conv->node()->inputs()[1]->sizes();
@@ -100,10 +86,8 @@ struct FuseAddBiasIntoConv final : public PredicateBasedPass {
     }
     // try to get feature M and rank from weight_shape
     if (weight_shape.size() > 0 && weight_shape[0].is_int) {
-      if (!is_transpose) {
-        ONNX_ASSERT(M == -1 || M == weight_shape[0].dim);
-        M = weight_shape[0].dim;
-      }
+      ONNX_ASSERT(M == -1 || M == weight_shape[0].dim);
+      M = weight_shape[0].dim;
       ONNX_ASSERT(rank == -1 ||
                   rank == static_cast<int64_t>(weight_shape.size()));
       rank = weight_shape.size();
