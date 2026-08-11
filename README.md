@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 # ONNX Optimizer
 
 [![PyPI version](https://img.shields.io/pypi/v/onnxoptimizer.svg)](https://pypi.python.org/pypi/onnxoptimizer/)
+[![npm version](https://img.shields.io/npm/v/onnxoptimizer.svg)](https://www.npmjs.com/package/onnxoptimizer)
 [![PyPI license](https://img.shields.io/pypi/l/onnxoptimizer.svg)](https://pypi.python.org/pypi/onnxoptimizer/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/onnx/optimizer/pulls)
 
@@ -42,6 +43,24 @@ pip3 install -e .
 
 Note that you need to install protobuf before building from source.
 
+### JavaScript
+
+The optimizer is also published to npm as a WebAssembly module, for Node.js and
+the browser:
+
+```bash
+npm install onnxoptimizer
+```
+
+```js
+import { optimize } from 'onnxoptimizer';
+
+const optimized = await optimize(modelBytes);
+```
+
+See [`js/README.md`](js/README.md) for the API, and
+[`js/PUBLISHING.md`](js/PUBLISHING.md) for how the package is built and
+released.
 
 ## Command-line API
 Now you can use command-line api in terminal instead of  python script.

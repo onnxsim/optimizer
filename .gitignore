@@ -56,6 +56,7 @@
 # build, distribute, and bins (+ python proto bindings)
 build/
 build_*/
+build-wasm/
 .build_debug/*
 .build_release/*
 .setuptools-cmake-build*/*

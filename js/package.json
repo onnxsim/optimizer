@@ -1,0 +1,49 @@
+{
+  "name": "onnxoptimizer",
+  "version": "0.4.2",
+  "description": "ONNX model optimizer (onnxoptimizer) compiled to WebAssembly, for Node.js and the browser",
+  "keywords": [
+    "onnx",
+    "onnxoptimizer",
+    "optimizer",
+    "wasm",
+    "webassembly",
+    "machine-learning"
+  ],
+  "homepage": "https://github.com/onnxsim/optimizer/tree/main/js#readme",
+  "bugs": {
+    "url": "https://github.com/onnxsim/optimizer/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/onnxsim/optimizer.git",
+    "directory": "js"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "bash scripts/build_wasm.sh",
+    "test": "node --test \"test/*.test.mjs\"",
+    "check-version": "node scripts/prepack.mjs --check-only",
+    "prepack": "node scripts/prepack.mjs"
+  }
+}

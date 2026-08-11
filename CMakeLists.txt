@@ -26,6 +26,33 @@ if(DEFINED BUILD_ONNX_PYTHON AND NOT DEFINED ONNX_BUILD_PYTHON)
   set(ONNX_BUILD_PYTHON ${BUILD_ONNX_PYTHON})
 endif()
 
+# The WebAssembly module published to npm (see js/README.md). Only built when
+# onnxoptimizer itself is the project being configured with the Emscripten
+# toolchain -- when a bigger project (onnxsim, for instance) adds onnxoptimizer
+# as a subdirectory it builds its own module and does not want this one, nor
+# the exception flags below.
+if(EMSCRIPTEN AND PROJECT_IS_TOP_LEVEL)
+  set(ONNX_OPTIMIZER_BUILD_WASM_DEFAULT ON)
+else()
+  set(ONNX_OPTIMIZER_BUILD_WASM_DEFAULT OFF)
+endif()
+option(ONNX_OPTIMIZER_BUILD_WASM "Build the WebAssembly module of the npm package"
+       ${ONNX_OPTIMIZER_BUILD_WASM_DEFAULT})
+
+if(ONNX_OPTIMIZER_BUILD_WASM)
+  if(NOT EMSCRIPTEN)
+    message(FATAL_ERROR "ONNX_OPTIMIZER_BUILD_WASM needs the Emscripten "
+                        "toolchain: configure with emcmake, or use "
+                        "js/scripts/build_wasm.sh")
+  endif()
+  # Emscripten compiles with exceptions disabled by default, while the
+  # optimizer reports unknown passes and broken models by throwing. The flags
+  # have to reach every target in this build tree (onnx and protobuf throw
+  # too), so they are set before the subdirectories are added.
+  add_compile_options(-fexceptions)
+  add_link_options(-fexceptions)
+endif()
+
 option(ONNX_OPT_USE_SYSTEM_PROTOBUF "" OFF)
 if(NOT ONNX_OPT_USE_SYSTEM_PROTOBUF)
   option(protobuf_BUILD_TESTS "" OFF)
@@ -69,6 +96,36 @@ target_include_directories(onnx_optimizer_c_api PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>
     )
+
+if(ONNX_OPTIMIZER_BUILD_WASM)
+  onnxopt_add_executable(onnxoptimizer_wasm onnxoptimizer/wasm/onnxoptimizer_wasm.cc)
+  target_link_libraries(onnxoptimizer_wasm PRIVATE onnx_optimizer)
+  target_compile_definitions(onnxoptimizer_wasm PRIVATE
+      ONNX_OPTIMIZER_VERSION_STRING="${ONNX_OPTIMIZER_VERSION}")
+  # js/src/index.mjs imports the generated onnxoptimizer.mjs, which loads
+  # onnxoptimizer.wasm from next to itself.
+  set_target_properties(onnxoptimizer_wasm PROPERTIES
+      OUTPUT_NAME onnxoptimizer
+      SUFFIX ".mjs")
+  target_link_options(onnxoptimizer_wasm PRIVATE
+      # The module has no main(); it is a library of exported functions.
+      --no-entry
+      -sMODULARIZE=1
+      -sEXPORT_ES6=1
+      -sEXPORT_NAME=createOnnxOptimizerModule
+      -sENVIRONMENT=web,worker,node
+      # Model buffers are held in the WASM heap while a model is optimized, so
+      # the memory a model needs is not known up front. 4 GB is the wasm32
+      # address space limit.
+      -sALLOW_MEMORY_GROWTH=1
+      -sMAXIMUM_MEMORY=4GB
+      # The IR passes recurse over the graph; the 64 KB default overflows on
+      # deep models.
+      -sSTACK_SIZE=4MB
+      -sEXPORTED_FUNCTIONS=_malloc,_free,_onnxopt_version,_onnxopt_last_error,_onnxopt_free,_onnxopt_available_passes,_onnxopt_fuse_and_elimination_passes,_onnxopt_optimize
+      -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,UTF8ToString,stringToUTF8,lengthBytesUTF8
+      )
+endif()
 
 if(ONNX_BUILD_PYTHON)
   find_package(

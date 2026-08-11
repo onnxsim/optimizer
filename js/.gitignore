@@ -1,0 +1,6 @@
+# The WebAssembly module, built by scripts/build_wasm.sh
+/dist/
+# Copied from the repository root by scripts/prepack.mjs
+/LICENSE
+node_modules/
+*.tgz

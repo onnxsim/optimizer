@@ -1,0 +1,119 @@
+# Copyright (c) ONNX Project Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build and Publish the npm package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+    paths:
+      - '.github/workflows/npm.yml'
+      - '.gitmodules'
+      - 'CMakeLists.txt'
+      - 'VERSION_NUMBER'
+      - 'cmake/**'
+      - 'js/**'
+      - 'onnxoptimizer/**'
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  # Keep in sync with the protobuf version onnx pins (third_party/onnx/sbom.cdx.json):
+  # onnx generates its C++ sources with a host protoc, and protobuf refuses
+  # generated code from a newer protoc than the runtime.
+  PROTOC_VERSION: 25.1
+  EMSDK_VERSION: 4.0.16
+
+jobs:
+  build:
+    name: Build the WebAssembly package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 # zizmor: ignore[cache-poisoning] the cache input is not set, so nothing is cached
+        with:
+          node-version: 22
+
+      - name: Install protoc
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSLO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          unzip -q "protoc-${PROTOC_VERSION}-linux-x86_64.zip" -d protoc
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Emscripten SDK
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install "$EMSDK_VERSION"
+          "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSDK_VERSION"
+
+      - name: Check that package.json and VERSION_NUMBER agree
+        run: npm run check-version
+        working-directory: js
+
+      - name: Build the WebAssembly module
+        run: |
+          . "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          ./js/scripts/build_wasm.sh
+
+      - name: Test
+        run: npm test
+        working-directory: js
+
+      - name: Pack
+        run: npm pack
+        working-directory: js
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package
+          path: js/*.tgz
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read
+      # For npm provenance.
+      id-token: write
+
+    environment:
+      name: release
+
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0 # zizmor: ignore[cache-poisoning] the cache input is not set, so nothing is cached
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+
+      - name: Check that the tag matches the package version
+        run: |
+          packed="onnxoptimizer-${GITHUB_REF_NAME#v}.tgz"
+          if [ ! -f "$packed" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match $(echo ./*.tgz)"
+            exit 1
+          fi
+
+      - name: Publish
+        run: npm publish "onnxoptimizer-${GITHUB_REF_NAME#v}.tgz" --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
