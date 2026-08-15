@@ -23,9 +23,13 @@ Pass::~Pass() {}
 unsigned int Pass::DescendOnGraphAttributesAndCount(
     Node* n,
     std::function<unsigned int(Graph&)> fn) {
+  // forEachAttributeNameAndKind(), not attributeNames() + kindOf(): this runs
+  // once per node visited by _runPassInternal below -- i.e. for every pass,
+  // every round of the optimizer's fixed point -- and attributeNames() would
+  // heap-allocate a vector per visit just to find the (usually zero) g/gs
+  // (If/Loop/Scan) attributes.
   unsigned int num_changes = 0;
-  for (auto name : n->attributeNames()) {
-    auto kind = n->kindOf(name);
+  n->forEachAttributeNameAndKind([&](Symbol name, AttributeKind kind) {
     if (kind == AttributeKind::g) {
       num_changes += fn(*n->g(name));
     }
@@ -34,15 +38,14 @@ unsigned int Pass::DescendOnGraphAttributesAndCount(
         num_changes += fn(*g);
       }
     }
-  }
+  });
   return num_changes;
 }
 
 void Pass::DescendOnGraphAttributesUnconstrained(
     Node* n,
     std::function<void(Graph&)> fn) {
-  for (auto name : n->attributeNames()) {
-    auto kind = n->kindOf(name);
+  n->forEachAttributeNameAndKind([&](Symbol name, AttributeKind kind) {
     if (kind == AttributeKind::g) {
       fn(*n->g(name));
     }
@@ -51,7 +54,7 @@ void Pass::DescendOnGraphAttributesUnconstrained(
         fn(*g);
       }
     }
-  }
+  });
 }
 
 PredicateBasedPass::~PredicateBasedPass() {}
