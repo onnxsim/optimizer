@@ -26,6 +26,26 @@ struct Optimizer {
   Optimizer(const std::vector<std::string> &names, const bool fixed_point);
   ~Optimizer();
 
+  // Optimize the ONNX C++ IR (Graph) in place, running the configured passes
+  // directly on the graph. This avoids the ModelProto <-> Graph round-trip
+  // entirely and is intended for C++ callers that already hold a Graph (e.g.
+  // onnxsim's OptAndShape fixed point, which imports once and can keep
+  // re-running passes on the same Graph across rounds where shape inference
+  // made no change -- see onnxsim issue #633). Proto-level concerns such as
+  // the ir_version upgrade and function copying are the caller's
+  // responsibility, since those live on ModelProto rather than on Graph.
+  //
+  // If `report` is non-null it is filled with a map from pass name to the
+  // total number of positive transforms that pass applied to the graph,
+  // matching the ModelProto-based optimize() below.
+  void optimize(Graph &graph,
+                std::map<std::string, unsigned int> *report = nullptr) {
+    auto analysis = this->pass_manager->run(graph);
+    if (report != nullptr && analysis != nullptr) {
+      *report = analysis->transform_counts;
+    }
+  }
+
   // If `report` is non-null it is filled with a map from pass name to the
   // total number of positive transforms that pass applied to the graph.
   ModelProto optimize(const ModelProto &_mp_in,
@@ -49,10 +69,7 @@ struct Optimizer {
     }
 
     ModelProto mp_out = PrepareOutput(*mp_in);
-    auto analysis = this->pass_manager->run(*g);
-    if (report != nullptr && analysis != nullptr) {
-      *report = analysis->transform_counts;
-    }
+    this->optimize(*g, report);
     ExportModelProto(&mp_out, g);
 
     // Maybe we can optimize these functions, now just copy
@@ -98,10 +115,7 @@ struct Optimizer {
     }
 
     ModelProto mp_out = PrepareOutput(mp_in);
-    auto analysis = this->pass_manager->run(*g);
-    if (report != nullptr && analysis != nullptr) {
-      *report = analysis->transform_counts;
-    }
+    this->optimize(*g, report);
     ExportModelProto(&mp_out, g, /*consume_tensor_data=*/true);
 
     // Maybe we can optimize these functions, now just copy
@@ -169,6 +183,20 @@ ModelProto Optimize(const ModelProto &mp_in,
 ModelProto OptimizeFixed(const ModelProto &mp_in,
                          const std::vector<std::string> &names,
                          std::map<std::string, unsigned int> *report = nullptr);
+
+// In-place counterparts that operate directly on the ONNX C++ IR (Graph),
+// skipping the ModelProto <-> Graph conversion entirely. For C++ callers
+// that already hold a Graph -- see Optimizer::optimize(Graph&, ...)'s doc
+// comment. Unlike the consuming ModelProto overloads below, these do not
+// depend on ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS: they never touch
+// ModelProto at all, so they work identically whether this library is
+// linked against onnxsim's onnx fork or onnxruntime's bundled, unpatched
+// onnx copy.
+void OptimizeGraph(Graph &graph, const std::vector<std::string> &names,
+                   std::map<std::string, unsigned int> *report = nullptr);
+
+void OptimizeGraphFixed(Graph &graph, const std::vector<std::string> &names,
+                        std::map<std::string, unsigned int> *report = nullptr);
 
 #ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 // Consuming overloads: see Optimizer::optimize(ModelProto&, ...)'s doc
