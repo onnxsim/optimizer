@@ -48,6 +48,17 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
   if (lhs->elem_type() != rhs->elem_type() || lhs->sizes() != rhs->sizes()) {
     return false;
   }
+  if (lhs->is_raw_data() && rhs->is_raw_data()) {
+    // Fast path: raw_data is always little-endian on disk regardless of host
+    // byte order (unlike ParseTensorData's typed accessors below, which
+    // return host-order values), so byte-identical raw_data always implies
+    // value-identical data, on any host -- this can never produce a false
+    // positive. Skips ParseTensorData<T>'s double copy (one to
+    // un-const/byte-swap the string, one to convert it to a typed vector),
+    // which otherwise dominates eliminate_duplicate_initializer's cost on
+    // models with large raw_data initializers (see onnxsim issue #633).
+    return lhs->raw() == rhs->raw();
+  }
 
 #define DO_CASE(pb_type, cpp_type)                                        \
   case ONNX_NAMESPACE::TensorProto_DataType_##pb_type:                    \
@@ -131,6 +142,19 @@ struct CSETensorHash {
     /// dtype、dims、value
     hash_combine(seed, int32_hasher, elem_type);
     hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());
+
+    if (tensor->is_raw_data()) {
+      // Fast path: hash the raw little-endian bytes directly instead of
+      // parsing them into a typed vector first (see CSETensorCompare's
+      // matching fast path for why this can't produce a false positive --
+      // the same raw() bytes are what that comparison checks). A tensor
+      // whose duplicate is stored via typed fields instead of raw_data (rare
+      // for real models) falls through to the per-element hash below and
+      // simply won't collide with this one, so it may go undetected as a
+      // duplicate -- a missed optimization, never an incorrect merge.
+      hash_combine(seed, std::hash<std::string>(), tensor->raw());
+      return seed;
+    }
 
 #define DO_CASE(pb_type, cpp_type)                     \
   case ONNX_NAMESPACE::TensorProto_DataType_##pb_type: \
