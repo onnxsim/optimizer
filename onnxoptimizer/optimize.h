@@ -60,6 +60,56 @@ struct Optimizer {
     return mp_out;
   }
 
+#ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
+  // Consuming overload: same as above, but moves each initializer's raw
+  // bytes out of `mp_in` on Import and out of the internal Graph on Export,
+  // instead of copying them at each end of the ModelProto<->Graph round
+  // trip. This roughly halves the memory traffic of one optimize() call for
+  // weight-heavy models (see onnxsim issue #633), at the cost of leaving
+  // `mp_in`'s initializer tensors with empty raw data afterward. Only call
+  // this when `mp_in` is about to be discarded or overwritten by the caller
+  // -- e.g. onnxsim's OptAndShape fixed point, which immediately
+  // move-assigns this call's return value back over its input model on
+  // every iteration.
+  //
+  // Only defined when compiled against an onnx fork that provides the
+  // matching consuming ImportModelProto/ExportModelProto overloads (see
+  // ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS in ir_pb_converter.h) --
+  // e.g. absent when this library is linked against onnxruntime's own
+  // bundled, unpatched onnx copy instead.
+  ModelProto optimize(ModelProto &mp_in,
+                      std::map<std::string, unsigned int> *report = nullptr) {
+    if (mp_in.ir_version() == 3) {
+      // Rare legacy path; not worth threading the moving Import/Export
+      // through, so fall back to the copying overload above.
+      const ModelProto &const_mp_in = mp_in;
+      return optimize(const_mp_in, report);
+    }
+    std::shared_ptr<Graph> g(ImportModelProto(mp_in));
+
+    if (g.get() == nullptr) {
+      std::cerr << "Warning: onnx optimizer is unable to parse input model. "
+                << "(The IR version of the ONNX model may be too old.)"
+                << std::endl;
+      // If we can't parse the file, just return the input. ImportModelProto
+      // fails before touching any tensor data (it only checks ir_version),
+      // so mp_in is still intact here.
+      return mp_in;
+    }
+
+    ModelProto mp_out = PrepareOutput(mp_in);
+    auto analysis = this->pass_manager->run(*g);
+    if (report != nullptr && analysis != nullptr) {
+      *report = analysis->transform_counts;
+    }
+    ExportModelProto(&mp_out, g, /*consume_tensor_data=*/true);
+
+    // Maybe we can optimize these functions, now just copy
+    AddFunctionsToModel(mp_in, mp_out);
+    return mp_out;
+  }
+#endif  // ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
+
  private:
   std::shared_ptr<PassManager> pass_manager;
 
@@ -119,5 +169,18 @@ ModelProto Optimize(const ModelProto &mp_in,
 ModelProto OptimizeFixed(const ModelProto &mp_in,
                          const std::vector<std::string> &names,
                          std::map<std::string, unsigned int> *report = nullptr);
+
+#ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
+// Consuming overloads: see Optimizer::optimize(ModelProto&, ...)'s doc
+// comment. Only call these when `mp_in` is about to be discarded or
+// overwritten by the caller.
+ModelProto Optimize(ModelProto &mp_in,
+                    const std::vector<std::string> &names,
+                    std::map<std::string, unsigned int> *report = nullptr);
+
+ModelProto OptimizeFixed(ModelProto &mp_in,
+                         const std::vector<std::string> &names,
+                         std::map<std::string, unsigned int> *report = nullptr);
+#endif  // ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE
