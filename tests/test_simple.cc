@@ -131,3 +131,72 @@ TEST(OptimizerTest, EliminateDuplicateInitializerTrustHash) {
     }
     onnx::optimization::SetTrustTensorContentHash(true);  // restore the default
 }
+
+// Regression test for a real model-regression finding: on ~90 real-world
+// models, switching CSE's default to trust=true (BLAKE3 digest equality)
+// left a handful of transformer models (albert/bert/bart/electra/mvp/
+// xcit_*) with MORE remaining nodes than before -- eliminate_common_
+// subexpression was merging fewer duplicate Constant nodes than it used to.
+// Root cause: for a *typed-field* (non-raw_data) tensor, the old exact
+// comparison used std::vector<float>::operator!= (IEEE754 value equality,
+// where +0.0f == -0.0f, and std::hash<float> is required to agree), while
+// TensorContentDigest hashed the parsed float array's raw bytes verbatim
+// (+0.0f and -0.0f have different bit patterns) -- so two Constant nodes
+// whose only difference was a signed zero stopped CSE-merging under
+// trust=true, and (since CSETensorHash's bucketing always uses the digest,
+// regardless of the trust setting) even under trust=false, since they never
+// landed in the same hash bucket to begin with. Fixed by canonicalizing
+// signed zero before hashing FLOAT/DOUBLE/COMPLEX64/COMPLEX128 typed-field
+// values (tensor_content_hash.cc's CanonicalizeZero). This test exercises
+// that fix via the real eliminate_common_subexpression pass, under both
+// trust settings, since the bug affected both.
+TEST(OptimizerTest, SignedZeroConstantCseUnderTrustHash) {
+    for (bool trust : {true, false}) {
+        onnx::optimization::SetTrustTensorContentHash(trust);
+
+        onnx::ModelProto m;
+        m.set_ir_version(7);
+        m.add_opset_import()->set_version(13);
+        auto* g = m.mutable_graph();
+        g->set_name("g");
+
+        auto add_const = [&](const std::string& out_name, float first_elem) {
+            auto* node = g->add_node();
+            node->set_op_type("Constant");
+            node->add_output(out_name);
+            auto* attr = node->add_attribute();
+            attr->set_name("value");
+            attr->set_type(onnx::AttributeProto_AttributeType_TENSOR);
+            auto* t = attr->mutable_t();
+            t->set_data_type(onnx::TensorProto_DataType_FLOAT);
+            t->add_dims(2);
+            // Typed-field (add_float_data), NOT raw_data -- the case where
+            // the old comparison and the digest-based comparison could
+            // disagree.
+            t->add_float_data(first_elem);
+            t->add_float_data(5.0f);
+        };
+        add_const("c1", 0.0f);
+        add_const("c2", -0.0f);
+        auto* add = g->add_node();
+        add->set_op_type("Add");
+        add->add_input("c1");
+        add->add_input("c2");
+        add->add_output("sum");
+        g->add_output()->set_name("sum");
+
+        auto optimized =
+            onnx::optimization::Optimize(m, {"eliminate_common_subexpression"});
+        ASSERT_EQ(optimized.graph().node_size(), 3)
+            << "trust=" << trust
+            << ": eliminate_common_subexpression only rewrites uses, "
+               "the dangling duplicate Constant node is still present";
+        const auto& add_node = optimized.graph().node(2);
+        ASSERT_EQ(add_node.op_type(), "Add");
+        EXPECT_EQ(add_node.input(0), add_node.input(1))
+            << "trust=" << trust
+            << ": c1 (+0.0) and c2 (-0.0) should CSE-merge like any other "
+               "value-identical Constant pair";
+    }
+    onnx::optimization::SetTrustTensorContentHash(true);  // restore the default
+}
