@@ -14,6 +14,24 @@ namespace {
 
 bool g_trust_tensor_content_hash = true;
 
+// IEEE754 defines +0.0 == -0.0, and std::hash<float>/std::hash<double> (and
+// hence the old, pre-digest CSETensorHash/CSETensorCompare, which hashed and
+// compared typed-field tensors via std::hash<T> and operator==) are required
+// by the C++ standard to agree: equal values must hash equal. A raw
+// byte/bit-pattern digest does not have that property (0x00000000 !=
+// 0x80000000), so hashing the typed-field parsed array's bytes verbatim
+// silently stopped CSE from deduplicating Constant/initializer tensors that
+// differ only in the sign of a zero -- a real, measured regression on
+// several transformer models (see onnxsim PR #641 model-regression
+// investigation). Canonicalizing to +0.0 before hashing restores the old
+// dedup coverage while keeping the digest-based speedup. This only matters
+// for the typed-field path below: the raw_data fast path already hashes
+// disk bytes verbatim in both the old and new code, so it never treated
+// +0.0/-0.0 as equal either way, and Float16/BFloat16 compare and hash by
+// bit pattern already (see data_type.h), so they need no adjustment.
+inline float CanonicalizeZero(float v) { return v == 0.0f ? 0.0f : v; }
+inline double CanonicalizeZero(double v) { return v == 0.0 ? 0.0 : v; }
+
 // dtype/shape/value bytes are hashed in host-native order throughout this
 // file: unlike onnxsim's TensorPool content hash (which is exported for
 // cross-process/cross-host verification and so must be endian-portable),
@@ -70,14 +88,48 @@ std::string TensorContentDigest(const Tensor& tensor) {
       DO_CASE(UINT16, uint16_t)
       DO_CASE(UINT32, uint32_t)
       DO_CASE(UINT64, uint64_t)
-      DO_CASE(FLOAT, float)
-      DO_CASE(DOUBLE, double)
-      DO_CASE(COMPLEX64, Complex64)
-      DO_CASE(COMPLEX128, Complex128)
       DO_CASE(FLOAT16, Float16)
       DO_CASE(BFLOAT16, BFloat16)
 
 #undef DO_CASE
+
+      // FLOAT/DOUBLE/COMPLEX64/COMPLEX128 hash a signed-zero-canonicalized
+      // copy instead of the DO_CASE macro's verbatim bytes -- see
+      // CanonicalizeZero's comment above for why.
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT: {
+        auto values = ParseTensorData<float>(&tensor);
+        for (auto& v : values) v = CanonicalizeZero(v);
+        blake3_hasher_update(&hasher, values.data(),
+                             values.size() * sizeof(float));
+        break;
+      }
+      case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE: {
+        auto values = ParseTensorData<double>(&tensor);
+        for (auto& v : values) v = CanonicalizeZero(v);
+        blake3_hasher_update(&hasher, values.data(),
+                             values.size() * sizeof(double));
+        break;
+      }
+      case ONNX_NAMESPACE::TensorProto_DataType_COMPLEX64: {
+        auto values = ParseTensorData<Complex64>(&tensor);
+        for (auto& v : values) {
+          v.real_part = CanonicalizeZero(v.real_part);
+          v.imaginary_part = CanonicalizeZero(v.imaginary_part);
+        }
+        blake3_hasher_update(&hasher, values.data(),
+                             values.size() * sizeof(Complex64));
+        break;
+      }
+      case ONNX_NAMESPACE::TensorProto_DataType_COMPLEX128: {
+        auto values = ParseTensorData<Complex128>(&tensor);
+        for (auto& v : values) {
+          v.real_part = CanonicalizeZero(v.real_part);
+          v.imaginary_part = CanonicalizeZero(v.imaginary_part);
+        }
+        blake3_hasher_update(&hasher, values.data(),
+                             values.size() * sizeof(Complex128));
+        break;
+      }
 
       case ONNX_NAMESPACE::TensorProto_DataType_BOOL: {
         // std::vector<bool> is bit-packed, not a contiguous array of
