@@ -16,6 +16,7 @@
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/logging.h"
 #include "onnxoptimizer/passes/string_utils.h"
+#include "onnxoptimizer/passes/tensor_content_hash.h"
 #include "onnxoptimizer/passes/tensor_util.h"
 
 namespace ONNX_NAMESPACE {
@@ -48,6 +49,20 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
   if (lhs->elem_type() != rhs->elem_type() || lhs->sizes() != rhs->sizes()) {
     return false;
   }
+
+  if (lhs->elem_type() != ONNX_NAMESPACE::TensorProto_DataType_STRING &&
+      GetTrustTensorContentHash()) {
+    // TensorContentDigest (tensor_content_hash.h) is a cryptographic
+    // (BLAKE3) hash of dtype + shape + values, covering both the raw_data
+    // and typed-field cases below in one pass -- trusting digest equality
+    // as tensor equality avoids re-deriving (ParseTensorData<T>, for a
+    // typed-field tensor) or re-scanning (raw_data) the tensor's full
+    // contents here, on top of whatever CSETensorHash already did to find
+    // this candidate. See GetTrustTensorContentHash's own comment for the
+    // (practically negligible) tradeoff, and how to disable it.
+    return TensorContentDigest(*lhs) == TensorContentDigest(*rhs);
+  }
+
   if (lhs->is_raw_data() && rhs->is_raw_data()) {
     // Fast path: raw_data is always little-endian on disk regardless of host
     // byte order (unlike ParseTensorData's typed accessors below, which
@@ -135,60 +150,28 @@ struct CSETensorHash {
   std::size_t operator()(const Tensor* tensor) const {
     /// https://github.com/onnx/onnx/issues/2630
     ONNX_ASSERT(tensor && !tensor->is_segment());
-    std::size_t seed = 0;
-    auto int32_hasher = std::hash<int32_t>();
-    auto size_hasher = std::hash<std::size_t>();
     const auto elem_type = tensor->elem_type();
-    /// dtype、dims、value
-    hash_combine(seed, int32_hasher, elem_type);
+
+    if (elem_type != ONNX_NAMESPACE::TensorProto_DataType_STRING) {
+      // TensorContentDigest (tensor_content_hash.h) already folds dtype +
+      // shape + values into one BLAKE3 pass -- including both the raw_data
+      // and typed-field cases this function used to hash separately below
+      // -- so hash THAT instead of redoing the work here. This is purely a
+      // faster/better bucketing key and holds regardless of
+      // GetTrustTensorContentHash(): CSETensorCompare (which that toggle
+      // does gate) still runs its own check on any bucket collision, so
+      // using this hash can never by itself cause two distinct tensors to
+      // be merged, whichever way that toggle is set.
+      return std::hash<std::string>()(TensorContentDigest(*tensor));
+    }
+
+    // Only STRING reaches here -- every other dtype (including UNDEFINED,
+    // and an unsupported dtype, which still throws) is handled by the
+    // digest path above, inside TensorContentDigest's own switch.
+    std::size_t seed = 0;
+    hash_combine(seed, std::hash<int32_t>(), elem_type);
     hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());
-
-    if (tensor->is_raw_data()) {
-      // Fast path: hash the raw little-endian bytes directly instead of
-      // parsing them into a typed vector first (see CSETensorCompare's
-      // matching fast path for why this can't produce a false positive --
-      // the same raw() bytes are what that comparison checks). A tensor
-      // whose duplicate is stored via typed fields instead of raw_data (rare
-      // for real models) falls through to the per-element hash below and
-      // simply won't collide with this one, so it may go undetected as a
-      // duplicate -- a missed optimization, never an incorrect merge.
-      hash_combine(seed, std::hash<std::string>(), tensor->raw());
-      return seed;
-    }
-
-#define DO_CASE(pb_type, cpp_type)                     \
-  case ONNX_NAMESPACE::TensorProto_DataType_##pb_type: \
-    hash_combine(seed, CSEContainerHash<cpp_type>(),   \
-                 ParseTensorData<cpp_type>(tensor));   \
-    break;
-
-    switch (elem_type) {
-      DO_CASE(BOOL, bool)
-      DO_CASE(INT8, int8_t)
-      DO_CASE(INT16, int16_t)
-      DO_CASE(INT32, int32_t)
-      DO_CASE(INT64, int64_t)
-      DO_CASE(UINT8, uint8_t)
-      DO_CASE(UINT16, uint16_t)
-      DO_CASE(UINT32, uint32_t)
-      DO_CASE(UINT64, uint64_t)
-      DO_CASE(FLOAT, float)
-      DO_CASE(DOUBLE, double)
-      DO_CASE(COMPLEX64, Complex64)
-      DO_CASE(COMPLEX128, Complex128)
-      DO_CASE(FLOAT16, Float16)
-      DO_CASE(BFLOAT16, BFloat16)
-
-#undef DO_CASE
-      case ONNX_NAMESPACE::TensorProto_DataType_STRING:
-        hash_combine(seed, CSEContainerHash<std::string>(), tensor->strings());
-        break;
-      case ONNX_NAMESPACE::TensorProto_DataType_UNDEFINED:
-        break;
-      default:
-        throw std::runtime_error(Str("no supported data type: ", elem_type));
-        break;
-    }
+    hash_combine(seed, CSEContainerHash<std::string>(), tensor->strings());
     return seed;
   }
 };
