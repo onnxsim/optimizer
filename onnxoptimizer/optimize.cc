@@ -43,6 +43,22 @@ ModelProto OptimizeFixed(
   Optimizer current_opt(names, true);
   return current_opt.optimize(mp_in, report);
 }
+#ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
+ModelProto Optimize(
+    ModelProto& mp_in,
+    const std::vector<std::string>& names,
+    std::map<std::string, unsigned int>* report) {
+  Optimizer current_opt(names, false);
+  return current_opt.optimize(mp_in, report);
+}
+ModelProto OptimizeFixed(
+    ModelProto& mp_in,
+    const std::vector<std::string>& names,
+    std::map<std::string, unsigned int>* report) {
+  Optimizer current_opt(names, true);
+  return current_opt.optimize(mp_in, report);
+}
+#endif  // ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 const std::vector<std::string> GetAvailablePasses() {
   return Optimizer::passes.GetAvailablePasses();
 }
