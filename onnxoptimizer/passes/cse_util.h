@@ -50,19 +50,6 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
     return false;
   }
 
-  if (lhs->elem_type() != ONNX_NAMESPACE::TensorProto_DataType_STRING &&
-      GetTrustTensorContentHash()) {
-    // TensorContentDigest (tensor_content_hash.h) is a cryptographic
-    // (BLAKE3) hash of dtype + shape + values, covering both the raw_data
-    // and typed-field cases below in one pass -- trusting digest equality
-    // as tensor equality avoids re-deriving (ParseTensorData<T>, for a
-    // typed-field tensor) or re-scanning (raw_data) the tensor's full
-    // contents here, on top of whatever CSETensorHash already did to find
-    // this candidate. See GetTrustTensorContentHash's own comment for the
-    // (practically negligible) tradeoff, and how to disable it.
-    return TensorContentDigest(*lhs) == TensorContentDigest(*rhs);
-  }
-
   if (lhs->is_raw_data() && rhs->is_raw_data()) {
     // Fast path: raw_data is always little-endian on disk regardless of host
     // byte order (unlike ParseTensorData's typed accessors below, which
@@ -72,7 +59,27 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
     // un-const/byte-swap the string, one to convert it to a typed vector),
     // which otherwise dominates eliminate_duplicate_initializer's cost on
     // models with large raw_data initializers (see onnxsim issue #633).
+    // This is already as cheap as a comparison can be (one memcmp via
+    // std::string::operator==), so -- deliberately, see
+    // tensor_content_hash.h's header comment -- it does NOT go through
+    // TensorContentDigest: BLAKE3 would only add cost here, not save any
+    // (most real models are raw_data-heavy, so this is the hot path).
     return lhs->raw() == rhs->raw();
+  }
+
+  if (lhs->elem_type() != ONNX_NAMESPACE::TensorProto_DataType_STRING &&
+      GetTrustTensorContentHash()) {
+    // Neither side is raw_data (or they mismatch raw_data-ness) here, so
+    // this is the typed-field case TensorContentDigest actually targets:
+    // trusting digest equality as tensor equality avoids re-deriving
+    // (ParseTensorData<T>) the tensor's full contents here, on top of
+    // whatever CSETensorHash already did to find this candidate -- and the
+    // digest is memoized per tensor pointer for the lifetime of this pass
+    // call (see ClearTensorContentDigestCache), so this is normally a cache
+    // hit, not a fresh BLAKE3 pass. See GetTrustTensorContentHash's own
+    // comment for the (practically negligible) tradeoff, and how to
+    // disable it.
+    return TensorContentDigest(*lhs) == TensorContentDigest(*rhs);
   }
 
 #define DO_CASE(pb_type, cpp_type)                                        \
@@ -152,22 +159,30 @@ struct CSETensorHash {
     ONNX_ASSERT(tensor && !tensor->is_segment());
     const auto elem_type = tensor->elem_type();
 
+    if (tensor->is_raw_data()) {
+      // Cheap byte hash, matching CSETensorCompare's raw_data fast path
+      // above -- no BLAKE3 here, see that comment for why.
+      std::size_t seed = 0;
+      hash_combine(seed, std::hash<int32_t>(), elem_type);
+      hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());
+      hash_combine(seed, std::hash<std::string>(), tensor->raw());
+      return seed;
+    }
+
     if (elem_type != ONNX_NAMESPACE::TensorProto_DataType_STRING) {
-      // TensorContentDigest (tensor_content_hash.h) already folds dtype +
-      // shape + values into one BLAKE3 pass -- including both the raw_data
-      // and typed-field cases this function used to hash separately below
-      // -- so hash THAT instead of redoing the work here. This is purely a
-      // faster/better bucketing key and holds regardless of
-      // GetTrustTensorContentHash(): CSETensorCompare (which that toggle
-      // does gate) still runs its own check on any bucket collision, so
-      // using this hash can never by itself cause two distinct tensors to
-      // be merged, whichever way that toggle is set.
+      // Typed-field, non-STRING: TensorContentDigest (tensor_content_hash.h,
+      // memoized per tensor pointer for this pass call) already folds
+      // dtype + shape + values into one BLAKE3 pass, so hash THAT instead
+      // of redoing the work here. This is purely a faster/better bucketing
+      // key and holds regardless of GetTrustTensorContentHash():
+      // CSETensorCompare (which that toggle does gate) still runs its own
+      // check on any bucket collision, so using this hash can never by
+      // itself cause two distinct tensors to be merged, whichever way that
+      // toggle is set.
       return std::hash<std::string>()(TensorContentDigest(*tensor));
     }
 
-    // Only STRING reaches here -- every other dtype (including UNDEFINED,
-    // and an unsupported dtype, which still throws) is handled by the
-    // digest path above, inside TensorContentDigest's own switch.
+    // Only STRING reaches here.
     std::size_t seed = 0;
     hash_combine(seed, std::hash<int32_t>(), elem_type);
     hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());

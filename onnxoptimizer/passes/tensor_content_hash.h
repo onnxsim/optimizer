@@ -45,6 +45,23 @@ namespace optimization {
 // reaching this).
 std::string TensorContentDigest(const Tensor& tensor);
 
+// TensorContentDigest is memoized per Tensor pointer (a full BLAKE3 pass is
+// too expensive to redo on every hash-bucket lookup and every equality
+// check against that bucket's candidates -- see cse_util.h's CSETensorHash/
+// CSETensorCompare, both of which call it for the same tensor within a
+// single pass invocation). The cache is valid ONLY within one call to
+// EliminateDuplicateInitializer::EliminateInitializer or
+// EliminateCommonSubexpression::EliminateCommonSubexpressions, since a
+// tensor's content is never mutated in place *during* either pass (only
+// nodes/edges are rewired, and any tensor a pass drops stays alive,
+// unmutated, for the rest of that same call) -- neither pass mutates a
+// retained tensor's bytes mid-call, but a tensor pointer CAN be reused by
+// an unrelated, differently-contented tensor once freed between calls (a
+// later optimizer pass, a later FixedPointFn round, or an entirely
+// different graph), so each pass clears this cache at entry rather than
+// relying on any cross-call invariant.
+void ClearTensorContentDigestCache();
+
 // See cse_util.h's CSETensorHash/CSETensorCompare for how this is
 // consulted. Defaults to true: those hash-bucket lookups and equality
 // checks trust TensorContentDigest equality as sufficient proof of tensor
