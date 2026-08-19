@@ -46,16 +46,18 @@ ModelProto OptimizeFixed(
 void OptimizeGraph(
     Graph& graph,
     const std::vector<std::string>& names,
-    std::map<std::string, unsigned int>* report) {
+    std::map<std::string, unsigned int>* report,
+    bool clear_tensor_digest_cache) {
   Optimizer current_opt(names, false);
-  current_opt.optimize(graph, report);
+  current_opt.optimize(graph, report, clear_tensor_digest_cache);
 }
 void OptimizeGraphFixed(
     Graph& graph,
     const std::vector<std::string>& names,
-    std::map<std::string, unsigned int>* report) {
+    std::map<std::string, unsigned int>* report,
+    bool clear_tensor_digest_cache) {
   Optimizer current_opt(names, true);
-  current_opt.optimize(graph, report);
+  current_opt.optimize(graph, report, clear_tensor_digest_cache);
 }
 #ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 ModelProto Optimize(
