@@ -4,6 +4,8 @@
 
 #include "onnxoptimizer/passes/tensor_content_hash.h"
 
+#include <unordered_map>
+
 #include "blake3/c/blake3.h"
 #include "onnxoptimizer/passes/string_utils.h"
 
@@ -13,6 +15,13 @@ namespace optimization {
 namespace {
 
 bool g_trust_tensor_content_hash = true;
+
+// See ClearTensorContentDigestCache's header comment for the validity scope
+// of this cache (one EliminateInitializer/EliminateCommonSubexpressions
+// call).
+std::unordered_map<const Tensor*, std::string> g_digest_cache;
+
+std::string ComputeTensorContentDigest(const Tensor& tensor);
 
 // IEEE754 defines +0.0 == -0.0, and std::hash<float>/std::hash<double> (and
 // hence the old, pre-digest CSETensorHash/CSETensorCompare, which hashed and
@@ -46,7 +55,9 @@ void UpdatePod(blake3_hasher* hasher, const T& v) {
 
 }  // namespace
 
-std::string TensorContentDigest(const Tensor& tensor) {
+namespace {
+
+std::string ComputeTensorContentDigest(const Tensor& tensor) {
   ONNX_ASSERT(!tensor.is_segment());
   ONNX_ASSERT(tensor.elem_type() !=
               ONNX_NAMESPACE::TensorProto_DataType_STRING);
@@ -156,6 +167,19 @@ std::string TensorContentDigest(const Tensor& tensor) {
                          32);
   return digest;
 }
+
+}  // namespace
+
+std::string TensorContentDigest(const Tensor& tensor) {
+  auto it = g_digest_cache.find(&tensor);
+  if (it != g_digest_cache.end()) {
+    return it->second;
+  }
+  return g_digest_cache.emplace(&tensor, ComputeTensorContentDigest(tensor))
+      .first->second;
+}
+
+void ClearTensorContentDigestCache() { g_digest_cache.clear(); }
 
 void SetTrustTensorContentHash(bool trust) {
   g_trust_tensor_content_hash = trust;
