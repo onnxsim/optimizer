@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
+#include <vector>
 
 #include "onnx/onnx_pb.h"
 #include "onnxoptimizer/pass.h"
@@ -49,6 +50,25 @@ struct CSEHashCompareTiming {
   double raw_compare_ms = 0.0;
   uint64_t typed_compare_calls = 0;
   double typed_compare_ms = 0.0;
+  // CSENodeHash/CSEEqual (below): the whole-node hash/equality machinery
+  // that eliminate_common_subexpression's hash_map keys on. Their cost is
+  // separate from raw_hash_*/typed_hash_* above -- those only fire for
+  // nodes with a tensor-valued (t/ts) attribute (e.g. Constant), while
+  // node_hash_ms/node_equal_ms cover every CSE-eligible node.
+  uint64_t node_hash_calls = 0;
+  double node_hash_ms = 0.0;
+  // Of node_hash_ms, time spent specifically in attributeNames() (an
+  // allocating std::vector<Symbol> return by value, see ir.h) plus sorting
+  // it -- isolated separately since it is the one obviously allocation-heavy
+  // step in an otherwise cheap hash.
+  uint64_t node_hash_attrsort_calls = 0;
+  double node_hash_attrsort_ms = 0.0;
+  uint64_t node_equal_calls = 0;
+  double node_equal_ms = 0.0;
+  // Same attributeNames()+sort isolation as node_hash_attrsort_*, but
+  // CSEEqual does it twice per call (once per side).
+  uint64_t node_equal_attrsort_calls = 0;
+  double node_equal_attrsort_ms = 0.0;
 };
 inline CSEHashCompareTiming g_cse_hash_compare_timing;
 inline void ResetCSEHashCompareTiming() {
@@ -329,6 +349,8 @@ struct CSEContainerHash<Tensor> {
 
 struct CSENodeHash {
   std::size_t operator()(const Node* n) const {
+    ScopedCSETiming _t(&g_cse_hash_compare_timing.node_hash_calls,
+                       &g_cse_hash_compare_timing.node_hash_ms);
     ONNX_ASSERT(n);
     std::size_t seed = 0;
     const auto inputs = n->inputs();
@@ -340,9 +362,15 @@ struct CSENodeHash {
     for (const auto& input : inputs) {
       hash_combine(seed, string_hasher, input->uniqueName());
     }
-    auto attribute_names = n->attributeNames();
-    SymbolCompare cmp;
-    std::sort(attribute_names.begin(), attribute_names.end(), cmp);
+    std::vector<Symbol> attribute_names;
+    {
+      ScopedCSETiming _attr_t(
+          &g_cse_hash_compare_timing.node_hash_attrsort_calls,
+          &g_cse_hash_compare_timing.node_hash_attrsort_ms);
+      attribute_names = n->attributeNames();
+      SymbolCompare cmp;
+      std::sort(attribute_names.begin(), attribute_names.end(), cmp);
+    }
     for (const auto& name : attribute_names) {
       hash_combine(seed, sym_hasher, name);
       auto kind = n->kindOf(name);
@@ -384,6 +412,8 @@ struct CSENodeHash {
 
 struct CSEEqual {
   bool operator()(const Node* lhs, const Node* rhs) const {
+    ScopedCSETiming _t(&g_cse_hash_compare_timing.node_equal_calls,
+                       &g_cse_hash_compare_timing.node_equal_ms);
     if (!lhs) {
       return !rhs;
     } else if (!rhs) {
@@ -394,11 +424,18 @@ struct CSEEqual {
     auto inputs_r = rhs->inputs();
     auto outputs_l = lhs->outputs();
     auto outputs_r = rhs->outputs();
-    auto attr_names_l = lhs->attributeNames();
-    auto attr_names_r = rhs->attributeNames();
-    SymbolCompare cmp;
-    std::sort(attr_names_l.begin(), attr_names_l.end(), cmp);
-    std::sort(attr_names_r.begin(), attr_names_r.end(), cmp);
+    std::vector<Symbol> attr_names_l;
+    std::vector<Symbol> attr_names_r;
+    {
+      ScopedCSETiming _attr_t(
+          &g_cse_hash_compare_timing.node_equal_attrsort_calls,
+          &g_cse_hash_compare_timing.node_equal_attrsort_ms);
+      attr_names_l = lhs->attributeNames();
+      attr_names_r = rhs->attributeNames();
+      SymbolCompare cmp;
+      std::sort(attr_names_l.begin(), attr_names_l.end(), cmp);
+      std::sort(attr_names_r.begin(), attr_names_r.end(), cmp);
+    }
     if (lhs->kind() != rhs->kind() || inputs_l.size() != inputs_r.size() ||
         outputs_l.size() != outputs_r.size() || attr_names_l != attr_names_r) {
       return false;
