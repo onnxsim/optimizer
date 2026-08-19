@@ -16,10 +16,9 @@ namespace {
 
 bool g_trust_tensor_content_hash = true;
 
-// See ClearTensorContentDigestCache's header comment for the validity scope
-// of this cache (one EliminateInitializer/EliminateCommonSubexpressions
-// call).
-std::unordered_map<const Tensor*, std::string> g_digest_cache;
+// Keyed by Tensor::tensor_id(), not by Tensor*: see ClearTensorContentDigestCache's
+// header comment for why, and for this cache's validity scope.
+std::unordered_map<uint64_t, std::string> g_digest_cache;
 
 std::string ComputeTensorContentDigest(const Tensor& tensor);
 
@@ -171,11 +170,12 @@ std::string ComputeTensorContentDigest(const Tensor& tensor) {
 }  // namespace
 
 std::string TensorContentDigest(const Tensor& tensor) {
-  auto it = g_digest_cache.find(&tensor);
+  const uint64_t id = tensor.tensor_id();
+  auto it = g_digest_cache.find(id);
   if (it != g_digest_cache.end()) {
     return it->second;
   }
-  return g_digest_cache.emplace(&tensor, ComputeTensorContentDigest(tensor))
+  return g_digest_cache.emplace(id, ComputeTensorContentDigest(tensor))
       .first->second;
 }
 

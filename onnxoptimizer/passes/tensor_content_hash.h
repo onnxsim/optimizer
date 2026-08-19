@@ -45,21 +45,31 @@ namespace optimization {
 // reaching this).
 std::string TensorContentDigest(const Tensor& tensor);
 
-// TensorContentDigest is memoized per Tensor pointer (a full BLAKE3 pass is
-// too expensive to redo on every hash-bucket lookup and every equality
-// check against that bucket's candidates -- see cse_util.h's CSETensorHash/
-// CSETensorCompare, both of which call it for the same tensor within a
-// single pass invocation). The cache is valid ONLY within one call to
-// EliminateDuplicateInitializer::EliminateInitializer or
-// EliminateCommonSubexpression::EliminateCommonSubexpressions, since a
-// tensor's content is never mutated in place *during* either pass (only
-// nodes/edges are rewired, and any tensor a pass drops stays alive,
-// unmutated, for the rest of that same call) -- neither pass mutates a
-// retained tensor's bytes mid-call, but a tensor pointer CAN be reused by
-// an unrelated, differently-contented tensor once freed between calls (a
-// later optimizer pass, a later FixedPointFn round, or an entirely
-// different graph), so each pass clears this cache at entry rather than
-// relying on any cross-call invariant.
+// TensorContentDigest is memoized per Tensor::tensor_id() (a full BLAKE3
+// pass is too expensive to redo on every hash-bucket lookup and every
+// equality check against that bucket's candidates -- see cse_util.h's
+// CSETensorHash/CSETensorCompare, both of which call it for the same tensor
+// possibly many times per pass invocation). Keyed by tensor_id() rather than
+// by `&tensor`: a `Tensor*` can be freed and its memory reused by an
+// unrelated, differently-contented tensor (e.g. after
+// Graph::eraseInitializer, or a Node attribute being replaced) within the
+// cache's validity window, which would silently alias a stale digest onto
+// the new tensor if keyed by address -- tensor_id() can't collide this way,
+// since Tensor mints a fresh one on every construction and every
+// (re)assignment (see tensor.h), so the cache naturally misses instead of
+// aliasing.
+//
+// Because of that, this cache's validity is NOT scoped to a single pass
+// call the way it once was: no onnx-optimizer pass mutates a *retained*
+// tensor's content in place (only nodes/edges are rewired, or a tensor is
+// dropped and replaced wholesale by a fresh one, which mints its own
+// tensor_id() and simply misses the cache) -- so entries for tensors that
+// are still alive and unchanged stay valid, and correct, across many pass
+// calls and many onnxsim OptAndShape/FixedPointFn rounds within the same
+// Optimizer::optimize(Graph&) call. See that function's
+// `clear_tensor_digest_cache` parameter for how a caller opts out of the
+// default per-call clear to extend this further, across its own repeated
+// optimize() calls on one resident Graph.
 void ClearTensorContentDigestCache();
 
 // See cse_util.h's CSETensorHash/CSETensorCompare for how this is

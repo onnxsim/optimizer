@@ -13,6 +13,7 @@
 
 #include "onnxoptimizer/pass_manager.h"
 #include "onnxoptimizer/pass_registry.h"
+#include "onnxoptimizer/passes/tensor_content_hash.h"
 
 #include "vector"
 
@@ -38,8 +39,24 @@ struct Optimizer {
   // If `report` is non-null it is filled with a map from pass name to the
   // total number of positive transforms that pass applied to the graph,
   // matching the ModelProto-based optimize() below.
+  //
+  // If `clear_tensor_digest_cache` is true (the default, and correct for
+  // essentially every caller), TensorContentDigest's cache
+  // (tensor_content_hash.h, consulted by eliminate_duplicate_initializer and
+  // eliminate_common_subexpression) is cleared before running the passes,
+  // bounding its memory to the tensors this one optimize() call touches.
+  // Pass false only if the caller itself manages that cache's lifetime
+  // across several optimize() calls on the *same* resident Graph (e.g.
+  // onnxsim's OptAndShape fixed point, which calls this once per round but
+  // wants digests computed in an earlier round to stay cached in a later
+  // one) -- see tensor_content_hash.h's ClearTensorContentDigestCache for
+  // why that's safe to do explicitly.
   void optimize(Graph &graph,
-                std::map<std::string, unsigned int> *report = nullptr) {
+                std::map<std::string, unsigned int> *report = nullptr,
+                bool clear_tensor_digest_cache = true) {
+    if (clear_tensor_digest_cache) {
+      ClearTensorContentDigestCache();
+    }
     auto analysis = this->pass_manager->run(graph);
     if (report != nullptr && analysis != nullptr) {
       *report = analysis->transform_counts;
@@ -192,11 +209,16 @@ ModelProto OptimizeFixed(const ModelProto &mp_in,
 // ModelProto at all, so they work identically whether this library is
 // linked against onnxsim's onnx fork or onnxruntime's bundled, unpatched
 // onnx copy.
+// `clear_tensor_digest_cache`: see Optimizer::optimize(Graph&, ...)'s doc
+// comment above -- the default (true) is correct for essentially every
+// caller.
 void OptimizeGraph(Graph &graph, const std::vector<std::string> &names,
-                   std::map<std::string, unsigned int> *report = nullptr);
+                   std::map<std::string, unsigned int> *report = nullptr,
+                   bool clear_tensor_digest_cache = true);
 
 void OptimizeGraphFixed(Graph &graph, const std::vector<std::string> &names,
-                        std::map<std::string, unsigned int> *report = nullptr);
+                        std::map<std::string, unsigned int> *report = nullptr,
+                        bool clear_tensor_digest_cache = true);
 
 #ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 // Consuming overloads: see Optimizer::optimize(ModelProto&, ...)'s doc
