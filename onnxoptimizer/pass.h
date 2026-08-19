@@ -9,7 +9,10 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <unordered_map>
+
 #include "onnx/common/ir.h"
 #include "onnx/onnx_pb.h"
 
@@ -20,6 +23,85 @@ namespace optimization {
 struct PostPassAnalysis {
   virtual ~PostPassAnalysis() = default;
 };
+
+// Exploratory diagnostic: per-pass-name timing split between
+// PredicateBasedPass's two phases -- "matching" (patternMatchPredicate,
+// scanning nodes for rewrite candidates) and "modifying" (runTransform,
+// actually rewriting a matched node) -- written for onnxsim issue #633's
+// investigation into where OptimizeGraphFixed's ~50-round fixed point
+// actually spends its time. Covers PredicateBasedPass-derived passes only
+// (the majority of the default suite: fuse_*, most eliminate_*); the
+// smaller number of FullGraphBasedPass passes (eliminate_duplicate_
+// initializer, eliminate_common_subexpression, DCE, ...) implement their
+// own single-phase runPass() and aren't split by this.
+//
+// Off by default (SetPassPhaseProfilingEnabled(true) to turn on) so normal
+// runs pay zero std::chrono overhead. Not thread-safe to toggle
+// concurrently with a running pass, matching this library's other global
+// toggles (e.g. tensor_content_hash.h's SetTrustTensorContentHash).
+struct PassPhaseTiming {
+  uint64_t match_calls = 0;
+  double match_ms = 0.0;
+  uint64_t transform_calls = 0;
+  double transform_ms = 0.0;
+};
+void SetPassPhaseProfilingEnabled(bool enabled);
+bool GetPassPhaseProfilingEnabled();
+const std::unordered_map<std::string, PassPhaseTiming> &GetPassPhaseTimings();
+void ResetPassPhaseTimings();
+
+// Companion to PassPhaseTiming, at coarser granularity: total wall time
+// inside each pass's runPass(Graph&) call (FixedPointPassManager::run's
+// call sites), covering BOTH pass kinds uniformly -- PredicateBasedPass's
+// per-node loop overhead that PassPhaseTiming's match/transform timers don't
+// capture (iterator traversal, DescendOnGraphAttributesAndCount, ...) and
+// FullGraphBasedPass passes (eliminate_duplicate_initializer, eliminate_
+// common_subexpression, DCE, ...) that don't have a matching/modifying split
+// at all. Shares SetPassPhaseProfilingEnabled's on/off toggle.
+struct PassTotalTiming {
+  uint64_t calls = 0;
+  double total_ms = 0.0;
+};
+void RecordPassTotalTime(const std::string &pass_name, double ms);
+const std::unordered_map<std::string, PassTotalTiming> &GetPassTotalTimings();
+void ResetPassTotalTimings();
+
+// Internal breakdown of EliminateCommonSubexpressions's own per-node loop
+// (eliminate_common_subexpression.h), beyond what cse_util.h's CSENodeHash/
+// CSEEqual instrumentation already measures inside the hash-map lookup
+// itself. `lookup_ms` covers the whole `hash_map.emplace()` call (hashing
+// plus, on a bucket collision, CSEEqual), so it overlaps with cse_util.h's
+// node_hash_ms/node_equal_ms -- the two are complementary views of the same
+// work, not additive. Shares SetPassPhaseProfilingEnabled's on/off toggle.
+struct CSEPassTiming {
+  uint64_t calls = 0;
+  uint64_t nodes_seen = 0;
+  uint64_t nodes_filtered_out = 0;
+  uint64_t nodes_replaced = 0;
+  double filter_ms = 0.0;
+  double lookup_ms = 0.0;
+  double replace_ms = 0.0;
+};
+void RecordCSEPassTiming(uint64_t nodes_seen, uint64_t nodes_filtered_out,
+                         uint64_t nodes_replaced, double filter_ms,
+                         double lookup_ms, double replace_ms);
+const CSEPassTiming &GetCSEPassTiming();
+void ResetCSEPassTiming();
+
+// Internal breakdown of EliminateDead's own reverse-order sweep
+// (eliminate_deadend.h). Shares SetPassPhaseProfilingEnabled's on/off
+// toggle.
+struct DeadendPassTiming {
+  uint64_t calls = 0;
+  uint64_t nodes_seen = 0;
+  uint64_t nodes_removed = 0;
+  double has_uses_ms = 0.0;
+  double destroy_ms = 0.0;
+};
+void RecordDeadendPassTiming(uint64_t nodes_seen, uint64_t nodes_removed,
+                             double has_uses_ms, double destroy_ms);
+const DeadendPassTiming &GetDeadendPassTiming();
+void ResetDeadendPassTiming();
 
 // Enum that represents the type of optimization it is.
 enum PassType {

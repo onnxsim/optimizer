@@ -10,10 +10,10 @@
 #include "onnx/common/ir.h"
 #include "onnx/common/ir_pb_converter.h"
 #include "onnx/proto_utils.h"
-
 #include "onnxoptimizer/pass_manager.h"
 #include "onnxoptimizer/pass_registry.h"
-
+#include "onnxoptimizer/passes/cse_util.h"
+#include "onnxoptimizer/passes/tensor_content_hash.h"
 #include "vector"
 
 namespace ONNX_NAMESPACE {
@@ -38,8 +38,28 @@ struct Optimizer {
   // If `report` is non-null it is filled with a map from pass name to the
   // total number of positive transforms that pass applied to the graph,
   // matching the ModelProto-based optimize() below.
+  //
+  // If `clear_tensor_digest_cache` is true (the default, and correct for
+  // essentially every caller), the two tensor-hash caches consulted by
+  // eliminate_duplicate_initializer and eliminate_common_subexpression --
+  // TensorContentDigest's (tensor_content_hash.h, the typed-field path) and
+  // CSETensorHash's raw_data-branch cache (cse_util.h's g_raw_hash_cache,
+  // the common path for real exported models) -- are cleared before
+  // running the passes, bounding their memory to the tensors this one
+  // optimize() call touches. Pass false only if the caller itself manages
+  // those caches' lifetime across several optimize() calls on the *same*
+  // resident Graph (e.g. onnxsim's OptAndShape fixed point, which calls
+  // this once per round but wants hashes computed in an earlier round to
+  // stay cached in a later one) -- see ClearTensorContentDigestCache's
+  // header comment for why that's safe to do explicitly (the same
+  // reasoning applies to ClearRawHashCache).
   void optimize(Graph &graph,
-                std::map<std::string, unsigned int> *report = nullptr) {
+                std::map<std::string, unsigned int> *report = nullptr,
+                bool clear_tensor_digest_cache = true) {
+    if (clear_tensor_digest_cache) {
+      ClearTensorContentDigestCache();
+      ClearRawHashCache();
+    }
     auto analysis = this->pass_manager->run(graph);
     if (report != nullptr && analysis != nullptr) {
       *report = analysis->transform_counts;
@@ -50,7 +70,7 @@ struct Optimizer {
   // total number of positive transforms that pass applied to the graph.
   ModelProto optimize(const ModelProto &_mp_in,
                       std::map<std::string, unsigned int> *report = nullptr) {
-    const ModelProto* mp_in = &_mp_in;
+    const ModelProto *mp_in = &_mp_in;
     std::unique_ptr<ModelProto> copy_in;
     if (mp_in->ir_version() == 3) {
       // Upgrade ir_version to 4 so that initializer can be not in input
@@ -129,8 +149,8 @@ struct Optimizer {
 
   void AddFunctionsToModel(const ModelProto &original_model,
                            ModelProto &output_model) {
-    for (const auto& function_proto : original_model.functions()) {
-      auto* p_f = output_model.add_functions();
+    for (const auto &function_proto : original_model.functions()) {
+      auto *p_f = output_model.add_functions();
       p_f->CopyFrom(function_proto);
     }
   }
@@ -192,18 +212,22 @@ ModelProto OptimizeFixed(const ModelProto &mp_in,
 // ModelProto at all, so they work identically whether this library is
 // linked against onnxsim's onnx fork or onnxruntime's bundled, unpatched
 // onnx copy.
+// `clear_tensor_digest_cache`: see Optimizer::optimize(Graph&, ...)'s doc
+// comment above -- the default (true) is correct for essentially every
+// caller.
 void OptimizeGraph(Graph &graph, const std::vector<std::string> &names,
-                   std::map<std::string, unsigned int> *report = nullptr);
+                   std::map<std::string, unsigned int> *report = nullptr,
+                   bool clear_tensor_digest_cache = true);
 
 void OptimizeGraphFixed(Graph &graph, const std::vector<std::string> &names,
-                        std::map<std::string, unsigned int> *report = nullptr);
+                        std::map<std::string, unsigned int> *report = nullptr,
+                        bool clear_tensor_digest_cache = true);
 
 #ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 // Consuming overloads: see Optimizer::optimize(ModelProto&, ...)'s doc
 // comment. Only call these when `mp_in` is about to be discarded or
 // overwritten by the caller.
-ModelProto Optimize(ModelProto &mp_in,
-                    const std::vector<std::string> &names,
+ModelProto Optimize(ModelProto &mp_in, const std::vector<std::string> &names,
                     std::map<std::string, unsigned int> *report = nullptr);
 
 ModelProto OptimizeFixed(ModelProto &mp_in,

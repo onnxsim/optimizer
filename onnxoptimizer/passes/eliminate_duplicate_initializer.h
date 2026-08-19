@@ -33,7 +33,6 @@
 #include "onnx/defs/tensor_util.h"
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/cse_util.h"
-#include "onnxoptimizer/passes/tensor_content_hash.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -60,10 +59,14 @@ struct EliminateDuplicateInitializer final : public FullGraphBasedPass {
   }
 
   unsigned int EliminateInitializer(Graph &graph) {
-    // Scoped to this call: see ClearTensorContentDigestCache's header
-    // comment for why it's safe here and must not be skipped.
-    ClearTensorContentDigestCache();
-
+    // No longer cleared here: TensorContentDigest's cache is keyed by
+    // Tensor::tensor_id(), which stays valid across pass calls and rounds
+    // (see tensor_content_hash.h's header comment) -- clearing it is now the
+    // caller's responsibility (Optimizer::optimize(Graph&, ...)'s
+    // clear_tensor_digest_cache parameter), so a longer-lived caller (e.g.
+    // onnxsim's OptAndShape) can opt out and keep entries warm across many
+    // rounds instead of paying this pass's full tensor-hashing cost on every
+    // one of them.
     unsigned int initializers_removed = 0;
     const std::vector<std::unique_ptr<Tensor>> &initializers =
         graph.initializers();
