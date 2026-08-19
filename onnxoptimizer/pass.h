@@ -9,7 +9,10 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <unordered_map>
+
 #include "onnx/common/ir.h"
 #include "onnx/onnx_pb.h"
 
@@ -20,6 +23,48 @@ namespace optimization {
 struct PostPassAnalysis {
   virtual ~PostPassAnalysis() = default;
 };
+
+// Exploratory diagnostic: per-pass-name timing split between
+// PredicateBasedPass's two phases -- "matching" (patternMatchPredicate,
+// scanning nodes for rewrite candidates) and "modifying" (runTransform,
+// actually rewriting a matched node) -- written for onnxsim issue #633's
+// investigation into where OptimizeGraphFixed's ~50-round fixed point
+// actually spends its time. Covers PredicateBasedPass-derived passes only
+// (the majority of the default suite: fuse_*, most eliminate_*); the
+// smaller number of FullGraphBasedPass passes (eliminate_duplicate_
+// initializer, eliminate_common_subexpression, DCE, ...) implement their
+// own single-phase runPass() and aren't split by this.
+//
+// Off by default (SetPassPhaseProfilingEnabled(true) to turn on) so normal
+// runs pay zero std::chrono overhead. Not thread-safe to toggle
+// concurrently with a running pass, matching this library's other global
+// toggles (e.g. tensor_content_hash.h's SetTrustTensorContentHash).
+struct PassPhaseTiming {
+  uint64_t match_calls = 0;
+  double match_ms = 0.0;
+  uint64_t transform_calls = 0;
+  double transform_ms = 0.0;
+};
+void SetPassPhaseProfilingEnabled(bool enabled);
+bool GetPassPhaseProfilingEnabled();
+const std::unordered_map<std::string, PassPhaseTiming> &GetPassPhaseTimings();
+void ResetPassPhaseTimings();
+
+// Companion to PassPhaseTiming, at coarser granularity: total wall time
+// inside each pass's runPass(Graph&) call (FixedPointPassManager::run's
+// call sites), covering BOTH pass kinds uniformly -- PredicateBasedPass's
+// per-node loop overhead that PassPhaseTiming's match/transform timers don't
+// capture (iterator traversal, DescendOnGraphAttributesAndCount, ...) and
+// FullGraphBasedPass passes (eliminate_duplicate_initializer, eliminate_
+// common_subexpression, DCE, ...) that don't have a matching/modifying split
+// at all. Shares SetPassPhaseProfilingEnabled's on/off toggle.
+struct PassTotalTiming {
+  uint64_t calls = 0;
+  double total_ms = 0.0;
+};
+void RecordPassTotalTime(const std::string &pass_name, double ms);
+const std::unordered_map<std::string, PassTotalTiming> &GetPassTotalTimings();
+void ResetPassTotalTimings();
 
 // Enum that represents the type of optimization it is.
 enum PassType {

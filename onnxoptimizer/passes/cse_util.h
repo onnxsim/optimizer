@@ -8,9 +8,12 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <type_traits>
 #include <typeinfo>
+#include <unordered_map>
 
 #include "onnx/onnx_pb.h"
 #include "onnxoptimizer/pass.h"
@@ -21,6 +24,86 @@
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
+
+// Exploratory diagnostic (onnxsim issue #633): splits CSETensorHash/
+// CSETensorCompare's cost by which of their two branches did the work --
+// raw_data (a cheap byte hash / a single memcmp, the common case for real
+// exported models) vs typed-field (a BLAKE3-digest-backed path, rarer). Off
+// by default; shares pass.h's SetPassPhaseProfilingEnabled toggle so it
+// switches on/off together with the pass-phase timers.
+struct CSEHashCompareTiming {
+  uint64_t raw_hash_calls = 0;
+  double raw_hash_ms = 0.0;
+  // Of raw_hash_calls above, how many were served from g_raw_hash_cache
+  // below instead of recomputed. On real (raw_data-heavy) exported models,
+  // measured 98%+ on onnxsim issue #633's repro -- most initializers are
+  // unchanged, unmutated Tensor objects from one OptAndShape round to the
+  // next, so their hash need only ever be computed once.
+  uint64_t raw_hash_cache_hits = 0;
+  double raw_hash_cache_hit_ms = 0.0;
+  uint64_t raw_hash_cache_misses = 0;
+  double raw_hash_cache_miss_ms = 0.0;
+  uint64_t typed_hash_calls = 0;
+  double typed_hash_ms = 0.0;
+  uint64_t raw_compare_calls = 0;
+  double raw_compare_ms = 0.0;
+  uint64_t typed_compare_calls = 0;
+  double typed_compare_ms = 0.0;
+};
+inline CSEHashCompareTiming g_cse_hash_compare_timing;
+inline void ResetCSEHashCompareTiming() {
+  g_cse_hash_compare_timing = {};
+}
+inline const CSEHashCompareTiming& GetCSEHashCompareTiming() {
+  return g_cse_hash_compare_timing;
+}
+
+// The actual cache: memoizes CSETensorHash's raw_data-branch seed by
+// Tensor::tensor_id() (never reused across distinct content -- fresh on
+// every construction/assignment, see tensor.h), so an unmutated tensor's
+// hash is computed once and reused on every later lookup instead of
+// rescanning its raw bytes from scratch each time. This is
+// eliminate_duplicate_initializer's dominant cost on raw_data-heavy models
+// (see onnxsim issue #633) -- CSETensorCompare's own raw_data fast path
+// (a single memcmp on a hash-bucket hit) was already cheap and is
+// unaffected.
+//
+// Cleared via ClearRawHashCache(), with the same lifetime rules as
+// tensor_content_hash.h's ClearTensorContentDigestCache (see that
+// function's header comment for the full rationale): no onnx-optimizer
+// pass mutates a retained tensor's content in place, so this safely
+// outlives a single pass call, up to whatever scope the caller (see
+// Optimizer::optimize(Graph&, ...)'s clear_tensor_digest_cache parameter)
+// chooses to clear it at.
+inline std::unordered_map<uint64_t, std::size_t> g_raw_hash_cache;
+inline void ClearRawHashCache() {
+  g_raw_hash_cache.clear();
+}
+
+// RAII: adds the scope's elapsed wall time to *ms and increments *calls on
+// destruction, only when profiling is on -- a no-op pair of branches
+// otherwise.
+class ScopedCSETiming {
+ public:
+  ScopedCSETiming(uint64_t* calls, double* ms)
+      : enabled_(GetPassPhaseProfilingEnabled()), calls_(calls), ms_(ms) {
+    if (enabled_)
+      start_ = std::chrono::steady_clock::now();
+  }
+  ~ScopedCSETiming() {
+    if (enabled_) {
+      const auto end = std::chrono::steady_clock::now();
+      (*calls_)++;
+      *ms_ += std::chrono::duration<double, std::milli>(end - start_).count();
+    }
+  }
+
+ private:
+  bool enabled_;
+  uint64_t* calls_;
+  double* ms_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 /// https://stackoverflow.com/questions/2590677/how-do-i-combine-hash-values-in-c0x
 inline void hash_combine(std::size_t& seed) {}
@@ -64,6 +147,8 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
     // tensor_content_hash.h's header comment -- it does NOT go through
     // TensorContentDigest: BLAKE3 would only add cost here, not save any
     // (most real models are raw_data-heavy, so this is the hot path).
+    ScopedCSETiming _t(&g_cse_hash_compare_timing.raw_compare_calls,
+                       &g_cse_hash_compare_timing.raw_compare_ms);
     return lhs->raw() == rhs->raw();
   }
 
@@ -79,6 +164,8 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
     // hit, not a fresh BLAKE3 pass. See GetTrustTensorContentHash's own
     // comment for the (practically negligible) tradeoff, and how to
     // disable it.
+    ScopedCSETiming _t(&g_cse_hash_compare_timing.typed_compare_calls,
+                       &g_cse_hash_compare_timing.typed_compare_ms);
     return TensorContentDigest(*lhs) == TensorContentDigest(*rhs);
   }
 
@@ -161,11 +248,44 @@ struct CSETensorHash {
 
     if (tensor->is_raw_data()) {
       // Cheap byte hash, matching CSETensorCompare's raw_data fast path
-      // above -- no BLAKE3 here, see that comment for why.
+      // above -- no BLAKE3 here, see that comment for why. Memoized by
+      // tensor_id() in g_raw_hash_cache: see that cache's own comment for
+      // why this is normally a hit, not a fresh scan of tensor->raw().
+      const bool profiling = GetPassPhaseProfilingEnabled();
+      std::chrono::steady_clock::time_point t0;
+      if (profiling)
+        t0 = std::chrono::steady_clock::now();
+
+      const uint64_t id = tensor->tensor_id();
+      auto cached = g_raw_hash_cache.find(id);
+      if (cached != g_raw_hash_cache.end()) {
+        if (profiling) {
+          const auto t1 = std::chrono::steady_clock::now();
+          const double ms =
+              std::chrono::duration<double, std::milli>(t1 - t0).count();
+          g_cse_hash_compare_timing.raw_hash_calls++;
+          g_cse_hash_compare_timing.raw_hash_ms += ms;
+          g_cse_hash_compare_timing.raw_hash_cache_hits++;
+          g_cse_hash_compare_timing.raw_hash_cache_hit_ms += ms;
+        }
+        return cached->second;
+      }
+
       std::size_t seed = 0;
       hash_combine(seed, std::hash<int32_t>(), elem_type);
       hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());
       hash_combine(seed, std::hash<std::string>(), tensor->raw());
+      g_raw_hash_cache.emplace(id, seed);
+
+      if (profiling) {
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        g_cse_hash_compare_timing.raw_hash_calls++;
+        g_cse_hash_compare_timing.raw_hash_ms += ms;
+        g_cse_hash_compare_timing.raw_hash_cache_misses++;
+        g_cse_hash_compare_timing.raw_hash_cache_miss_ms += ms;
+      }
       return seed;
     }
 
@@ -179,6 +299,8 @@ struct CSETensorHash {
       // check on any bucket collision, so using this hash can never by
       // itself cause two distinct tensors to be merged, whichever way that
       // toggle is set.
+      ScopedCSETiming _t(&g_cse_hash_compare_timing.typed_hash_calls,
+                         &g_cse_hash_compare_timing.typed_hash_ms);
       return std::hash<std::string>()(TensorContentDigest(*tensor));
     }
 
