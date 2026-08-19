@@ -154,7 +154,7 @@ inline const Tensor* FetchConstantTensor(const Value* v) {
   if (kind == kConstant && v->node()->hasAttribute(kvalue)) {
     return &v->node()->t(kvalue);
   } else if (InitializersAsConstants() && graph->is_constant_initializer(v)) {
-    return &*graph->getInitializer(v->uniqueName());
+    return graph->getInitializer(v->uniqueName());
   } else {
     return nullptr;
   }

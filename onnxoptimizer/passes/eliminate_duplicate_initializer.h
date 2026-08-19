@@ -65,7 +65,8 @@ struct EliminateDuplicateInitializer final : public FullGraphBasedPass {
     ClearTensorContentDigestCache();
 
     unsigned int initializers_removed = 0;
-    const std::vector<Tensor> &initializers = graph.initializers();
+    const std::vector<std::unique_ptr<Tensor>> &initializers =
+        graph.initializers();
 
     // Make {name : Value} map
     std::unordered_set<std::string> input_set;
@@ -81,10 +82,12 @@ struct EliminateDuplicateInitializer final : public FullGraphBasedPass {
         output_set.emplace(out->uniqueName());
       }
     }
-    std::unordered_map<const Tensor *, std::string, CSETensorHash, CSETensorEqual>
+    std::unordered_map<const Tensor *, std::string, CSETensorHash,
+                       CSETensorEqual>
         initializer_map;
     std::vector<std::pair<std::string, std::string>> replaced_table;
-    for (const auto& initializer : initializers) {
+    for (const auto &initializer_ptr : initializers) {
+      const Tensor &initializer = *initializer_ptr;
       if (!initializer.hasName()) {
         continue;
       }
