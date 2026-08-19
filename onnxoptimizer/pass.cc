@@ -15,6 +15,8 @@ namespace {
 bool g_pass_phase_profiling_enabled = false;
 std::unordered_map<std::string, PassPhaseTiming> g_pass_phase_timings;
 std::unordered_map<std::string, PassTotalTiming> g_pass_total_timings;
+CSEPassTiming g_cse_pass_timing;
+DeadendPassTiming g_deadend_pass_timing;
 }  // namespace
 
 void SetPassPhaseProfilingEnabled(bool enabled) {
@@ -45,6 +47,43 @@ const std::unordered_map<std::string, PassTotalTiming>& GetPassTotalTimings() {
 
 void ResetPassTotalTimings() {
   g_pass_total_timings.clear();
+}
+
+void RecordCSEPassTiming(uint64_t nodes_seen, uint64_t nodes_filtered_out,
+                         uint64_t nodes_replaced, double filter_ms,
+                         double lookup_ms, double replace_ms) {
+  g_cse_pass_timing.calls++;
+  g_cse_pass_timing.nodes_seen += nodes_seen;
+  g_cse_pass_timing.nodes_filtered_out += nodes_filtered_out;
+  g_cse_pass_timing.nodes_replaced += nodes_replaced;
+  g_cse_pass_timing.filter_ms += filter_ms;
+  g_cse_pass_timing.lookup_ms += lookup_ms;
+  g_cse_pass_timing.replace_ms += replace_ms;
+}
+
+const CSEPassTiming& GetCSEPassTiming() {
+  return g_cse_pass_timing;
+}
+
+void ResetCSEPassTiming() {
+  g_cse_pass_timing = CSEPassTiming();
+}
+
+void RecordDeadendPassTiming(uint64_t nodes_seen, uint64_t nodes_removed,
+                             double has_uses_ms, double destroy_ms) {
+  g_deadend_pass_timing.calls++;
+  g_deadend_pass_timing.nodes_seen += nodes_seen;
+  g_deadend_pass_timing.nodes_removed += nodes_removed;
+  g_deadend_pass_timing.has_uses_ms += has_uses_ms;
+  g_deadend_pass_timing.destroy_ms += destroy_ms;
+}
+
+const DeadendPassTiming& GetDeadendPassTiming() {
+  return g_deadend_pass_timing;
+}
+
+void ResetDeadendPassTiming() {
+  g_deadend_pass_timing = DeadendPassTiming();
 }
 
 Pass::Pass(PassType pass_type, PassEfficiency pass_efficiency,

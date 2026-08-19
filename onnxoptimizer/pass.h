@@ -66,6 +66,43 @@ void RecordPassTotalTime(const std::string &pass_name, double ms);
 const std::unordered_map<std::string, PassTotalTiming> &GetPassTotalTimings();
 void ResetPassTotalTimings();
 
+// Internal breakdown of EliminateCommonSubexpressions's own per-node loop
+// (eliminate_common_subexpression.h), beyond what cse_util.h's CSENodeHash/
+// CSEEqual instrumentation already measures inside the hash-map lookup
+// itself. `lookup_ms` covers the whole `hash_map.emplace()` call (hashing
+// plus, on a bucket collision, CSEEqual), so it overlaps with cse_util.h's
+// node_hash_ms/node_equal_ms -- the two are complementary views of the same
+// work, not additive. Shares SetPassPhaseProfilingEnabled's on/off toggle.
+struct CSEPassTiming {
+  uint64_t calls = 0;
+  uint64_t nodes_seen = 0;
+  uint64_t nodes_filtered_out = 0;
+  uint64_t nodes_replaced = 0;
+  double filter_ms = 0.0;
+  double lookup_ms = 0.0;
+  double replace_ms = 0.0;
+};
+void RecordCSEPassTiming(uint64_t nodes_seen, uint64_t nodes_filtered_out,
+                         uint64_t nodes_replaced, double filter_ms,
+                         double lookup_ms, double replace_ms);
+const CSEPassTiming &GetCSEPassTiming();
+void ResetCSEPassTiming();
+
+// Internal breakdown of EliminateDead's own reverse-order sweep
+// (eliminate_deadend.h). Shares SetPassPhaseProfilingEnabled's on/off
+// toggle.
+struct DeadendPassTiming {
+  uint64_t calls = 0;
+  uint64_t nodes_seen = 0;
+  uint64_t nodes_removed = 0;
+  double has_uses_ms = 0.0;
+  double destroy_ms = 0.0;
+};
+void RecordDeadendPassTiming(uint64_t nodes_seen, uint64_t nodes_removed,
+                             double has_uses_ms, double destroy_ms);
+const DeadendPassTiming &GetDeadendPassTiming();
+void ResetDeadendPassTiming();
+
 // Enum that represents the type of optimization it is.
 enum PassType {
   // Class of optimizations that fuses operations.
