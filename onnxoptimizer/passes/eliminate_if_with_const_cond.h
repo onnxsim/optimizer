@@ -52,7 +52,19 @@ struct EliminateIfWithConstCond final : public PredicateBasedPass {
                     NodeDestroyType &destroy_current) override {
     const auto cond_value = if_node->input();
     const Tensor *cond_tensor = FetchConstantTensor(cond_value);
-    const bool cond = ParseTensorData<bool>(cond_tensor)[0];
+    if (cond_tensor == nullptr) {
+      // Not usable as a constant -- e.g. its bytes are not locally available
+      // (data_location == EXTERNAL). patternMatchPredicate only checked that
+      // the node is structurally a constant, not that FetchConstantTensor can
+      // actually hand back its value; give up on this transform rather than
+      // reading past a null pointer.
+      return false;
+    }
+    const std::vector<bool> cond_data = ParseTensorData<bool>(cond_tensor);
+    if (cond_data.empty()) {
+      return false;
+    }
+    const bool cond = cond_data[0];
     auto &parent_graph = graph;
     const auto subgraph = if_node->g(cond ? kthen_branch : kelse_branch);
 

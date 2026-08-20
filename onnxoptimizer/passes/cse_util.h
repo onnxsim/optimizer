@@ -149,6 +149,18 @@ inline bool CSETensorCompare(const Tensor* lhs, const Tensor* rhs) {
     return !lhs;
   }
   ONNX_ASSERT(!lhs->is_segment() && !rhs->is_segment());
+  if (lhs->has_data_location() || rhs->has_data_location()) {
+    // Neither side's bytes are locally available (data_location == EXTERNAL
+    // -- e.g. an embedder's TensorPool-backed loading left a large tensor
+    // un-hydrated). Without reading the actual data there is no way to know
+    // whether two such tensors hold the same content, so treat them as equal
+    // only when they are literally the same Tensor object -- never silently
+    // equate two distinct EXTERNAL tensors just because they share a
+    // shape/dtype (and so both have empty parsed data), which would merge
+    // genuinely different weights (eliminate_duplicate_initializer /
+    // eliminate_common_subexpression).
+    return lhs == rhs;
+  }
   if (lhs->elem_type() != rhs->elem_type() || lhs->sizes() != rhs->sizes()) {
     return false;
   }
@@ -265,6 +277,17 @@ struct CSETensorHash {
     /// https://github.com/onnx/onnx/issues/2630
     ONNX_ASSERT(tensor && !tensor->is_segment());
     const auto elem_type = tensor->elem_type();
+
+    if (tensor->has_data_location()) {
+      // See CSETensorCompare's identical check: an EXTERNAL tensor's bytes
+      // aren't available to hash, so key it by object identity
+      // (tensor_id(), a fresh value per Tensor construction/assignment --
+      // see tensor.h) instead of by content. That guarantees it never
+      // collides with (and so is never merged with) a *different* EXTERNAL
+      // tensor purely because both happen to have empty/absent data and the
+      // same shape/dtype.
+      return std::hash<uint64_t>()(tensor->tensor_id());
+    }
 
     if (tensor->is_raw_data()) {
       // Cheap byte hash, matching CSETensorCompare's raw_data fast path

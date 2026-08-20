@@ -128,13 +128,27 @@ bool InitializersAsConstants();
 inline bool IsConstantTensor(const Value* v) {
   auto* graph = v->owningGraph();
   if (v->node()->kind() == kConstant) {
-    return true;
+    if (!v->node()->hasAttribute(kvalue)) {
+      return false;
+    }
+    // A tensor whose bytes are not locally available (data_location ==
+    // EXTERNAL -- e.g. an embedder's TensorPool-backed loading left a large
+    // Constant value un-hydrated) is not usable as a constant by the
+    // value-reading passes built on this check (FetchConstantTensor /
+    // GetValueFromInput and everything gated by them): claiming it here
+    // would let those passes proceed to read/copy its (empty) contents as
+    // if they were real data. See FetchConstantTensor's identical check.
+    return !v->node()->t(kvalue).has_data_location();
   }
   // When initializers are treated as non-constant, a value backed only by an
   // initializer is not a constant, so value-baking passes (fuse_bn_into_conv,
   // nop-reshape on a constant shape, ...) leave it -- and the weight it
   // represents -- untouched. Constant *nodes* stay constant either way.
-  return InitializersAsConstants() && graph->is_constant_initializer(v);
+  if (!InitializersAsConstants() || !graph->is_constant_initializer(v)) {
+    return false;
+  }
+  const Tensor* tensor = graph->getInitializer(v->uniqueName());
+  return tensor != nullptr && !tensor->has_data_location();
 }
 
 template <typename W, typename... Args>
@@ -151,13 +165,23 @@ bool IsConstantTensor(const Node* n, const W& which_input,
 inline const Tensor* FetchConstantTensor(const Value* v) {
   const uint32_t kind = v->node()->kind();
   auto* graph = v->owningGraph();
+  const Tensor* tensor = nullptr;
   if (kind == kConstant && v->node()->hasAttribute(kvalue)) {
-    return &v->node()->t(kvalue);
+    tensor = &v->node()->t(kvalue);
   } else if (InitializersAsConstants() && graph->is_constant_initializer(v)) {
-    return graph->getInitializer(v->uniqueName());
-  } else {
+    tensor = graph->getInitializer(v->uniqueName());
+  }
+  if (tensor != nullptr && tensor->has_data_location()) {
+    // EXTERNAL (or any other non-DEFAULT location): the tensor's bytes are
+    // not locally available -- see IsConstantTensor's identical check just
+    // above, which every caller here should already be consistent with.
+    // Treat it as "not fetchable" so every caller (isAllOf/isUnit,
+    // isABroadcastToB, eliminate_if_with_const_cond, fuse_bn_into_conv, ...)
+    // takes its existing "give up, don't fold" path instead of silently
+    // reading empty/zero data as if it were the tensor's real values.
     return nullptr;
   }
+  return tensor;
 }
 
 template <typename T, typename Sym,

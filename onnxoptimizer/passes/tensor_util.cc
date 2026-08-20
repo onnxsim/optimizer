@@ -26,10 +26,30 @@ int64_t ElemCntOfTensor(const Tensor& tensor) {
 
 /// reference onnx/defs/tensor_util.cc
 
+// Defense in depth: every KNOWN caller of ParseTensorData already checks a
+// tensor's availability first (FetchConstantTensor/IsConstantTensor's own
+// data_location check, or CSETensorHash/CSETensorCompare's identical guard --
+// see pass_util.h and cse_util.h), so this should never actually fire. It
+// exists in case some future or unaudited call site reaches ParseTensorData
+// directly on a tensor whose data_location is EXTERNAL (bytes not locally
+// available, e.g. an embedder's TensorPool-backed loading left it
+// un-hydrated): silently returning an empty vector there -- as the
+// typed-field branch below would, since an un-hydrated tensor carries no
+// typed fields either -- lets a caller misread "no data" as "zero/empty
+// data", which is a correctness bug (not just a missed optimization), so
+// fail loudly instead.
+#define ASSERT_TENSOR_DATA_AVAILABLE(tensor)                              \
+  ONNX_ASSERTM(!(tensor)->has_data_location(),                            \
+              "ParseTensorData: tensor '", (tensor)->name(),              \
+              "' has no locally available data (data_location != "       \
+              "DEFAULT); the caller must check availability (e.g. via "   \
+              "FetchConstantTensor) before parsing tensor values")
+
 #define DEFINE_PARSE_TENSOR_DATA(type, typed_data_fetch)                   \
   template <>                                                              \
   const std::vector<type> ParseTensorData(const Tensor* tensor) {          \
     ONNX_ASSERT(tensor != nullptr);                                        \
+    ASSERT_TENSOR_DATA_AVAILABLE(tensor);                                  \
     std::vector<type> res;                                                 \
     if (!tensor->is_raw_data()) {                                          \
       const auto& data = tensor->typed_data_fetch();                       \
@@ -87,6 +107,7 @@ DEFINE_PARSE_TENSOR_DATA(BFloat16, int32s)
 
 template <>
 const std::vector<bool> ParseTensorData<bool>(const Tensor* tensor) {
+  ASSERT_TENSOR_DATA_AVAILABLE(tensor);
   std::vector<bool> res;
   if (!tensor->is_raw_data()) {
     std::transform(tensor->int32s().cbegin(), tensor->int32s().cend(),
@@ -124,6 +145,7 @@ const std::vector<Complex> FlattenToComplex(
   template <>                                                              \
   const std::vector<type> ParseTensorData<type>(const Tensor* tensor) {    \
     ONNX_ASSERT(tensor != nullptr);                                        \
+    ASSERT_TENSOR_DATA_AVAILABLE(tensor);                                  \
     if (!tensor->is_raw_data()) {                                          \
       return FlattenToComplex<type>(tensor->typed_data_fetch());           \
     }                                                                      \
@@ -171,12 +193,15 @@ template <>
 const std::vector<std::string> ParseTensorData<std::string>(
     const Tensor* tensor) {
   ONNX_ASSERT(tensor != nullptr);
+  ASSERT_TENSOR_DATA_AVAILABLE(tensor);
   ONNX_ASSERTM(!tensor->is_raw_data(),
                "data type is string. string content is required to be stored "
                "in repeated bytes string_data field."
                "raw_data type cannot be string.");
   return tensor->strings();
 }
+
+#undef ASSERT_TENSOR_DATA_AVAILABLE
 
 }  // namespace optimization
 }  // namespace ONNX_NAMESPACE
