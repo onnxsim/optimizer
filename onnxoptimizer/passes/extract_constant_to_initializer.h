@@ -33,6 +33,18 @@ struct ExtractConstantToInitializer final : public PredicateBasedPass {
     return node->kind() == kConstant && node->hasAttribute(kvalue);
   }
 
+  // This pass instance is reused across every round of onnxsim's
+  // simplification fixed point, but a batch of reserved names is only valid
+  // for the graph state it was reserved against -- other passes/rounds can
+  // introduce new names in between. Drop any leftover reservation from a
+  // prior runPass() call so nextReservedName() always reserves fresh against
+  // the current graph.
+  bool initializePass(Graph&) override {
+    reserved_names_.clear();
+    reserved_used_ = 0;
+    return false;
+  }
+
   bool runTransform(Node* node, Graph& graph,
                     NodeDestroyType& destroy_current) override {
     Tensor t = node->t(kvalue);
@@ -42,8 +54,16 @@ struct ExtractConstantToInitializer final : public PredicateBasedPass {
                   node->output()) == graph.outputs().rend()) {
       t.setName(node->output()->uniqueName());
       new_init = graph.addInitializerAndCreateValue(t);
-      node->output()->setUniqueName(graph.getNextUniqueName(), false);
+      node->output()->setUniqueName(nextReservedName(graph), false);
     } else {
+      // addInitializerAndCreateValue -> addInitializer auto-generates a name
+      // via getNextUniqueName() when t's is empty (the common case here, a
+      // Constant node's embedded tensor rarely carries its own name); reserve
+      // one up front instead so that path also goes through the batched
+      // reservation below rather than paying a fresh full-graph scan here.
+      if (t.name().empty()) {
+        t.setName(nextReservedName(graph));
+      }
       new_init = graph.addInitializerAndCreateValue(t);
     }
     const bool replacing_success =
@@ -53,6 +73,28 @@ struct ExtractConstantToInitializer final : public PredicateBasedPass {
     }
     destroy_current = NodeDestroyType::DestroyOne;
     return true;
+  }
+
+ private:
+  // A model with many Constant nodes (e.g. the window-partition index/shape
+  // constants in a shifted-window-attention model) makes this pass call
+  // Graph::getNextUniqueName() once per match -- and each such call pays a
+  // full graph (and subgraph) scan of its own, turning this otherwise-linear
+  // pass into an accidental O(matches * graph size) cost (see onnxsim issue
+  // #651's follow-up). Draw fresh names from a small batch reserved via
+  // Graph::reserveUniqueNames() (one scan per batch) instead of one scan per
+  // name; refilled lazily so a graph with few Constant nodes still pays only
+  // one (cheap) reservation.
+  static constexpr size_t kNameBatchSize = 256;
+  std::vector<std::string> reserved_names_;
+  size_t reserved_used_ = 0;
+
+  std::string nextReservedName(Graph& graph) {
+    if (reserved_used_ >= reserved_names_.size()) {
+      reserved_names_ = graph.reserveUniqueNames(kNameBatchSize);
+      reserved_used_ = 0;
+    }
+    return std::move(reserved_names_[reserved_used_++]);
   }
 };
 
