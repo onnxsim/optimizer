@@ -488,6 +488,28 @@ struct ToCppType<TensorProto_DataType_BOOL> {
   using type = bool;
 };
 
+// Whether ``graph`` (including any nested If/Loop/Scan subgraph bodies)
+// contains a ``kCaptured`` placeholder node -- the only thing
+// Value::uses()'s extra owningGraph()->forEachNode() scan (on top of the
+// O(1) uses_in_current_graph_ it always includes) can ever find; see that
+// method's definition in onnx/common/ir.h. When this is false, every
+// value's uses() is exactly its uses_in_current_graph_, so a caller that
+// needs many nodes' hasUses() in a tight loop (eliminate_deadend,
+// eliminate_common_subexpression) can compute this once up front and use
+// the O(1) Value/Node::hasUsesInCurrentGraph() instead of paying uses()'s
+// O(graph size) subgraph scan on every single node -- turning an
+// accidentally-quadratic full-graph pass into a linear one for the common
+// case of a graph with no control-flow ops at all (see onnxsim issue #651).
+inline bool GraphMayHaveCapturedValues(const Graph& graph) {
+  bool found = false;
+  graph.forEachNode([&found](const Node* node) {
+    if (!found && node->kind() == kCaptured) {
+      found = true;
+    }
+  });
+  return found;
+}
+
 }  // namespace optimization
 
 }  // namespace ONNX_NAMESPACE
