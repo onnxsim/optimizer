@@ -44,6 +44,11 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
     double lookup_ms = 0.0;
     double replace_ms = 0.0;
     std::unordered_map<Node *, Node *, CSENodeHash, CSEEqual> hash_map;
+    // See eliminate_deadend.h's identical use of GraphMayHaveCapturedValues
+    // for why this turns hasUses() from an accidental O(nodes) cost on every
+    // one of this loop's O(nodes) iterations into O(1), for the overwhelming
+    // majority of graphs that have no control-flow ops at all.
+    const bool may_have_captures = GraphMayHaveCapturedValues(graph);
     for (auto it = node_list.begin(); it != node_list.end(); ++it) {
       auto node = *it;
       auto kind = node->kind();
@@ -51,11 +56,15 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
       bool skip;
       if (profiling) {
         const auto t0 = std::chrono::steady_clock::now();
-        skip = !node->hasUses() || !IsSupportedByCSE(node);
+        skip = (may_have_captures ? !node->hasUses()
+                                  : !node->hasUsesInCurrentGraph()) ||
+               !IsSupportedByCSE(node);
         const auto t1 = std::chrono::steady_clock::now();
         filter_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
       } else {
-        skip = !node->hasUses() || !IsSupportedByCSE(node);
+        skip = (may_have_captures ? !node->hasUses()
+                                  : !node->hasUsesInCurrentGraph()) ||
+               !IsSupportedByCSE(node);
       }
       if (skip) {
         nodes_filtered_out++;
@@ -69,7 +78,8 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
       // bucket collision, CSEEqual -- see cse_util.h's node_hash_ms/
       // node_equal_ms for that same work's own breakdown.
       std::chrono::steady_clock::time_point t0;
-      if (profiling) t0 = std::chrono::steady_clock::now();
+      if (profiling)
+        t0 = std::chrono::steady_clock::now();
       auto insertion = hash_map.emplace(node, node);
       if (profiling) {
         const auto t1 = std::chrono::steady_clock::now();
@@ -80,7 +90,8 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
         auto outputs = other->outputs();
         auto replaced_outputs = node->outputs();
         std::chrono::steady_clock::time_point t2;
-        if (profiling) t2 = std::chrono::steady_clock::now();
+        if (profiling)
+          t2 = std::chrono::steady_clock::now();
         for (int i = 0; i < outputs.size(); ++i) {
           if (tryReplacingAllUsesWith(replaced_outputs[i], outputs[i])) {
             VLOG(1) << Str("kind: ", kind.toString(), ", ", node->name(), " [",
