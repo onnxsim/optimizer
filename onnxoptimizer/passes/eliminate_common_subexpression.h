@@ -14,6 +14,7 @@
 #include "onnxoptimizer/passes/logging.h"
 #include "onnxoptimizer/passes/pass_util.h"
 #include "onnxoptimizer/passes/string_utils.h"
+#include "onnxoptimizer/passes/tensor_content_hash.h"
 
 namespace ONNX_NAMESPACE {
 namespace optimization {
@@ -30,6 +31,10 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
   }
 
   unsigned int EliminateCommonSubexpressions(Graph &graph) {
+    // Scoped to this call: see ClearTensorContentDigestCache's header
+    // comment for why it's safe here and must not be skipped.
+    ClearTensorContentDigestCache();
+
     auto node_list = graph.nodes();
     unsigned int cse_removed = 0;
     std::unordered_map<Node *, Node *, CSENodeHash, CSEEqual> hash_map;
@@ -41,10 +46,11 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
       }
       VLOG(2) << Str("kind: ", kind.toString(), ", ", node->name(),
                      " is processing");
-      if (hash_map.find(node) == hash_map.end()) {
-        hash_map[node] = node;
-      } else {
-        auto other = hash_map.at(node);
+      // A single emplace instead of find()-then-[]/at(): see
+      // EliminateDuplicateInitializer's identical fix for why.
+      auto insertion = hash_map.emplace(node, node);
+      if (!insertion.second) {
+        auto other = insertion.first->second;
         auto outputs = other->outputs();
         auto replaced_outputs = node->outputs();
         for (int i = 0; i < outputs.size(); ++i) {

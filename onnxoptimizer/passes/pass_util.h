@@ -119,9 +119,22 @@ T1 AddYIfNegative(T1 x, T2 y) {
   return x < 0 ? x + y : x;
 }
 
+// Whether the fusion/elimination passes currently treat graph initializers as
+// constant tensors. Toggled with SetInitializersAsConstants (declared in
+// optimize.h); declared here because the inline constant helpers below consult
+// it. Defaults to true (historical behaviour).
+bool InitializersAsConstants();
+
 inline bool IsConstantTensor(const Value* v) {
   auto* graph = v->owningGraph();
-  return v->node()->kind() == kConstant || graph->is_constant_initializer(v);
+  if (v->node()->kind() == kConstant) {
+    return true;
+  }
+  // When initializers are treated as non-constant, a value backed only by an
+  // initializer is not a constant, so value-baking passes (fuse_bn_into_conv,
+  // nop-reshape on a constant shape, ...) leave it -- and the weight it
+  // represents -- untouched. Constant *nodes* stay constant either way.
+  return InitializersAsConstants() && graph->is_constant_initializer(v);
 }
 
 template <typename W, typename... Args>
@@ -140,8 +153,8 @@ inline const Tensor* FetchConstantTensor(const Value* v) {
   auto* graph = v->owningGraph();
   if (kind == kConstant && v->node()->hasAttribute(kvalue)) {
     return &v->node()->t(kvalue);
-  } else if (graph->is_constant_initializer(v)) {
-    return &*graph->getInitializer(v->uniqueName());
+  } else if (InitializersAsConstants() && graph->is_constant_initializer(v)) {
+    return graph->getInitializer(v->uniqueName());
   } else {
     return nullptr;
   }
