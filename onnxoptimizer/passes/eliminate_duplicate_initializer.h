@@ -59,6 +59,14 @@ struct EliminateDuplicateInitializer final : public FullGraphBasedPass {
   }
 
   unsigned int EliminateInitializer(Graph &graph) {
+    // No longer cleared here: TensorContentDigest's cache is keyed by
+    // Tensor::tensor_id(), which stays valid across pass calls and rounds
+    // (see tensor_content_hash.h's header comment) -- clearing it is now the
+    // caller's responsibility (Optimizer::optimize(Graph&, ...)'s
+    // clear_tensor_digest_cache parameter), so a longer-lived caller (e.g.
+    // onnxsim's OptAndShape) can opt out and keep entries warm across many
+    // rounds instead of paying this pass's full tensor-hashing cost on every
+    // one of them.
     unsigned int initializers_removed = 0;
     const std::vector<Tensor> &initializers = graph.initializers();
 
@@ -76,10 +84,11 @@ struct EliminateDuplicateInitializer final : public FullGraphBasedPass {
         output_set.emplace(out->uniqueName());
       }
     }
-    std::unordered_map<const Tensor *, std::string, CSETensorHash, CSETensorEqual>
+    std::unordered_map<const Tensor *, std::string, CSETensorHash,
+                       CSETensorEqual>
         initializer_map;
     std::vector<std::pair<std::string, std::string>> replaced_table;
-    for (const auto& initializer : initializers) {
+    for (const auto &initializer : initializers) {
       if (!initializer.hasName()) {
         continue;
       }
@@ -92,11 +101,12 @@ struct EliminateDuplicateInitializer final : public FullGraphBasedPass {
       if (output_set.find(name) != output_set.end()) {
         continue;
       }
-      if (initializer_map.count(&initializer) == 0) {
-        initializer_map[&initializer] = name;
-      } else {
-        replaced_table.emplace_back(
-            std::make_pair(name, initializer_map.at(&initializer)));
+      // A single emplace instead of count()-then-[]/at(): the latter pair
+      // independently hashes (and, on a bucket hit, re-compares) the same
+      // tensor twice per initializer for no benefit.
+      auto insertion = initializer_map.emplace(&initializer, name);
+      if (!insertion.second) {
+        replaced_table.emplace_back(name, insertion.first->second);
       }
     }
     if (replaced_table.empty()) {

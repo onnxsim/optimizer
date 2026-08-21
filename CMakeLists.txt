@@ -48,8 +48,30 @@ file(GLOB onnx_opt_srcs CONFIGURE_DEPENDS "onnxoptimizer/*.cc"
     )
 list(REMOVE_ITEM onnx_opt_srcs "${PROJECT_SOURCE_DIR}/onnxoptimizer/cpp2py_export.cc")
 
+# BLAKE3 (third_party/blake3, a git submodule pinned to a specific upstream
+# commit -- see .gitmodules / `git submodule status`, and LICENSE_A2 /
+# LICENSE_CC0 in that directory) backing tensor_content_hash.cc's
+# TensorContentDigest, used by cse_util.h's CSETensorHash/CSETensorCompare.
+# Only the portable C sources (under the submodule's own c/ subdirectory --
+# upstream's layout) are compiled, with every SIMD backend disabled: that
+# makes blake3_dispatch.c's runtime CPU-feature dispatch fall through to
+# blake3_portable.c unconditionally, which is what makes omitting the SIMD
+# source files (and their per-architecture assembly) correct rather than
+# merely omitted. Mirrors onnxsim's own onnxsim/tensor_pool_hash.cpp
+# vendoring of the same library.
+set(ONNXOPT_BLAKE3_SOURCES
+    third_party/blake3/c/blake3.c
+    third_party/blake3/c/blake3_dispatch.c
+    third_party/blake3/c/blake3_portable.c)
+set(ONNXOPT_BLAKE3_COMPILE_DEFS
+    BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512
+    BLAKE3_USE_NEON=0)
+list(APPEND onnx_opt_srcs ${ONNXOPT_BLAKE3_SOURCES})
+
 onnxopt_add_library(onnx_optimizer ${onnx_opt_srcs})
 target_link_libraries(onnx_optimizer PUBLIC ${ONNX_TARGET_NAME})
+target_compile_definitions(onnx_optimizer PRIVATE ${ONNXOPT_BLAKE3_COMPILE_DEFS})
+target_include_directories(onnx_optimizer PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 target_include_directories(onnx_optimizer PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>

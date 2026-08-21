@@ -37,6 +37,7 @@ def optimize(
     passes: list[str] | None = None,
     fixed_point: bool = False,
     return_report: bool = False,
+    initializers_as_constants: bool = True,
 ) -> onnx.ModelProto | tuple[onnx.ModelProto, dict[str, int]]:
     """Apply the optimization on the serialized ModelProto.
 
@@ -47,6 +48,12 @@ def optimize(
             reaches a fixed point.
         return_report: When ``True``, also return a report describing how many
             times each pass modified the graph.
+        initializers_as_constants: Whether the passes may treat graph
+            initializers as constant tensors (the default, ``True``). When set
+            to ``False`` initializers are treated as non-constant, so
+            value-baking passes such as ``fuse_bn_into_conv`` leave
+            initializer-backed weights untouched; ``Constant`` nodes are still
+            treated as constants.
 
     Return:
         The optimized model. When ``return_report`` is ``True``, a tuple of
@@ -60,6 +67,20 @@ def optimize(
         passes = get_fuse_and_elimination_passes()
     if not isinstance(model, onnx.ModelProto):
         raise TypeError(f"Optimizer only accepts ModelProto, incorrect type: {type(model)}")
+    # The C++ core reads this switch from thread-local state deep inside the
+    # passes, so set it around the call and restore it afterwards to avoid
+    # leaking the setting to unrelated callers on the same thread.
+    previous = _c.initializers_as_constants()
+    _c.set_initializers_as_constants(initializers_as_constants)
+    try:
+        return _optimize_impl(model, passes, fixed_point, return_report)
+    finally:
+        _c.set_initializers_as_constants(previous)
+
+
+def _optimize_impl(
+    model: onnx.ModelProto, passes: list[str], fixed_point: bool, return_report: bool
+) -> onnx.ModelProto | tuple[onnx.ModelProto, dict[str, int]]:
     try:
         model_str = model.SerializeToString()
         if return_report:

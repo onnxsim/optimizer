@@ -43,6 +43,38 @@ ModelProto OptimizeFixed(
   Optimizer current_opt(names, true);
   return current_opt.optimize(mp_in, report);
 }
+void OptimizeGraph(
+    Graph& graph,
+    const std::vector<std::string>& names,
+    std::map<std::string, unsigned int>* report,
+    bool clear_tensor_digest_cache) {
+  Optimizer current_opt(names, false);
+  current_opt.optimize(graph, report, clear_tensor_digest_cache);
+}
+void OptimizeGraphFixed(
+    Graph& graph,
+    const std::vector<std::string>& names,
+    std::map<std::string, unsigned int>* report,
+    bool clear_tensor_digest_cache) {
+  Optimizer current_opt(names, true);
+  current_opt.optimize(graph, report, clear_tensor_digest_cache);
+}
+#ifdef ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
+ModelProto Optimize(
+    ModelProto& mp_in,
+    const std::vector<std::string>& names,
+    std::map<std::string, unsigned int>* report) {
+  Optimizer current_opt(names, false);
+  return current_opt.optimize(mp_in, report);
+}
+ModelProto OptimizeFixed(
+    ModelProto& mp_in,
+    const std::vector<std::string>& names,
+    std::map<std::string, unsigned int>* report) {
+  Optimizer current_opt(names, true);
+  return current_opt.optimize(mp_in, report);
+}
+#endif  // ONNX_IR_PB_CONVERTER_HAS_CONSUMING_OVERLOADS
 const std::vector<std::string> GetAvailablePasses() {
   return Optimizer::passes.GetAvailablePasses();
 }

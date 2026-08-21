@@ -35,7 +35,13 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
       [](const nb::bytes& bytes, const std::vector<std::string>& names) {
         ModelProto proto{};
         ParseProtoFromPyBytes(&proto, bytes);
-        auto const result = optimization::Optimize(proto, names);
+        // Explicitly const: pins overload resolution to the copying
+        // Optimize(const ModelProto&, ...) even though `proto` happens to be
+        // unused afterward here, so this call site's behavior can't change
+        // silently if a consuming overload is ever added upstream of it (see
+        // Optimizer::optimize(ModelProto&, ...) in optimize.h).
+        auto const result = optimization::Optimize(
+            static_cast<const ModelProto&>(proto), names);
         std::string out;
         result.SerializeToString(&out);
         return nb::bytes(out.data(), out.size());
@@ -46,7 +52,8 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
       [](const nb::bytes& bytes, const std::vector<std::string>& names) {
         ModelProto proto{};
         ParseProtoFromPyBytes(&proto, bytes);
-        auto const result = optimization::OptimizeFixed(proto, names);
+        auto const result = optimization::OptimizeFixed(
+            static_cast<const ModelProto&>(proto), names);
         std::string out;
         result.SerializeToString(&out);
         return nb::bytes(out.data(), out.size());
@@ -83,7 +90,8 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
                                const std::string& export_data_file_name) {
         ModelProto proto{};
         optimization::loadModel(&proto, import_model_path, true);
-        auto result = optimization::Optimize(proto, names);
+        auto result = optimization::Optimize(
+            static_cast<const ModelProto&>(proto), names);
         optimization::saveModel(&result, export_model_path, true,
                                 export_data_file_name);
       });
@@ -111,7 +119,8 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
          const std::string& export_data_file_name) {
         ModelProto proto{};
         optimization::loadModel(&proto, import_model_path, true);
-        auto result = optimization::OptimizeFixed(proto, names);
+        auto result = optimization::OptimizeFixed(
+            static_cast<const ModelProto&>(proto), names);
         optimization::saveModel(&result, export_model_path, true,
                                 export_data_file_name);
       });
@@ -134,5 +143,11 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
                              &optimization::GetAvailablePasses);
   onnx_opt_cpp2py_export.def("get_fuse_and_elimination_passes",
                              &optimization::GetFuseAndEliminationPass);
+  // Toggle whether the passes treat graph initializers as constant tensors
+  // (default true). See SetInitializersAsConstants in optimize.h.
+  onnx_opt_cpp2py_export.def("set_initializers_as_constants",
+                             &optimization::SetInitializersAsConstants);
+  onnx_opt_cpp2py_export.def("initializers_as_constants",
+                             &optimization::InitializersAsConstants);
 }
 }  // namespace ONNX_NAMESPACE
