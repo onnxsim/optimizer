@@ -53,7 +53,14 @@ struct ExtractConstantToInitializer final : public PredicateBasedPass {
         std::find(graph.outputs().rbegin(), graph.outputs().rend(),
                   node->output()) == graph.outputs().rend()) {
       t.setName(node->output()->uniqueName());
-      new_init = graph.addInitializerAndCreateValue(t);
+      // t is a local temporary this call never touches again -- move it
+      // into the new initializer instead of copying (addInitializerAndCreateValue
+      // has an rvalue overload for exactly this) to skip a second deep copy
+      // of its raw_data/typed-data fields on top of the one `node->t(kvalue)`
+      // already paid above. On a model with many Constant nodes this pass
+      // was ~half its own cost (see bench/RESULTS_profiling_survey.md's
+      // ONNXSIM_PROFILE_PASS_PHASES data).
+      new_init = graph.addInitializerAndCreateValue(std::move(t));
       node->output()->setUniqueName(nextReservedName(graph), false);
     } else {
       // addInitializerAndCreateValue -> addInitializer auto-generates a name
@@ -64,7 +71,7 @@ struct ExtractConstantToInitializer final : public PredicateBasedPass {
       if (t.name().empty()) {
         t.setName(nextReservedName(graph));
       }
-      new_init = graph.addInitializerAndCreateValue(t);
+      new_init = graph.addInitializerAndCreateValue(std::move(t));
     }
     const bool replacing_success =
         tryReplacingAllUsesWith(node->output(), new_init);
