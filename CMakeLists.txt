@@ -75,6 +75,21 @@ if(ONNX_BUILD_PYTHON)
     Python 3
     REQUIRED COMPONENTS Interpreter Development.Module
     OPTIONAL_COMPONENTS Development.SABIModule)
+  # nanobind's own CMake config reads the VERSIONED, plural "Python3_INCLUDE_DIRS"
+  # variable specifically -- it is not populated by the unversioned
+  # find_package(Python ...) above (a different CMake module/variable
+  # namespace from find_package(Python3 ...)). On a normal host build,
+  # find_package(Python3) elsewhere in the dependency graph (e.g. onnx's own
+  # CMakeLists.txt) has usually already populated it, so this goes unnoticed;
+  # cross-compiling (e.g. for wasm32-emscripten) can hit this find_package(Python)
+  # call with nothing else in the build ever having populated the Python3_*
+  # variables, and nanobind then fails outright with "Python.h file not found"
+  # even though Development.Module was found immediately above. Bridge it
+  # explicitly rather than relying on some other part of the build to have
+  # incidentally populated it first.
+  if(NOT DEFINED Python3_INCLUDE_DIRS AND DEFINED Python_INCLUDE_DIRS)
+    set(Python3_INCLUDE_DIRS "${Python_INCLUDE_DIRS}")
+  endif()
   nanobind_add_module(onnx_opt_cpp2py_export "onnxoptimizer/cpp2py_export.cc" STABLE_ABI)
   target_link_libraries(onnx_opt_cpp2py_export PRIVATE onnx_optimizer)
 endif()
