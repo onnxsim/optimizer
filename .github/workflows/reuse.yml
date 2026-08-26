@@ -6,6 +6,10 @@ name: REUSE Compliance Check
 
 on: [push, pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:  # set top-level default permissions as security good practice
   contents: read
 
