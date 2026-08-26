@@ -175,9 +175,12 @@ TEST(OptimizerTest, EliminateDuplicateInitializerLargeRawData) {
     // w1/w2: hash-colliding but byte-distinct -- must NOT be merged.
     add_init("w1", base);
     add_init("w2", differs_in_gap);
-    // w3/w4: genuinely identical -- must still be merged.
-    add_init("w3", base);
-    add_init("w4", base);
+    // w3/w4: genuinely identical to each other (but distinct from base) --
+    // must still be merged. A different fill byte, not just a different
+    // offset, so this pair can't also collide with w1/w2's hash.
+    const std::string other(n, 'C');
+    add_init("w3", other);
+    add_init("w4", other);
 
     for (const char* name : {"w1", "w2", "w3", "w4"}) {
         auto* n_ = graph->add_node();
