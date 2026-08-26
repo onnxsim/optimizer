@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <string_view>
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
@@ -133,6 +134,50 @@ void hash_combine(std::size_t& seed, const Hasher& hasher, const T& v,
                   Rest... rest) {
   seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
   hash_combine(seed, rest...);
+}
+
+// A byte hash for CSETensorHash's raw_data path (below) whose cost is
+// bounded by a small constant, however large the tensor is -- unlike
+// g_raw_hash_cache above, a raw_data initializer's *first* hash is not a
+// caching gap: it's paid exactly once no matter what (see that cache's own
+// comment), so on raw_data-heavy models with large tensors it was this
+// function's previous std::hash<std::string>() full-buffer scan, not a
+// cache miss, that dominated eliminate_duplicate_initializer's cost (see
+// onnxsim issue #633 follow-up profiling).
+//
+// This is safe to make approximate: CSETensorHash only needs to be a good
+// *bucketing* key. The sole source of truth for equality is
+// CSETensorCompare's raw_data fast path -- a full lhs->raw() == rhs->raw()
+// memcmp, run on every hash-bucket hit regardless of how the hash was
+// computed -- so a lower-quality/sampled hash can never cause an incorrect
+// merge. The only cost of a spurious collision (two distinct tensors that
+// happen to match on the sampled bytes) is one extra, already-cheap memcmp
+// against a candidate that turns out not to match.
+inline std::size_t HashRawDataBounded(const std::string& raw) {
+  // Below this size, a full hash is already cheap -- and exact rather than
+  // sampled, so small tensors keep today's collision behavior exactly.
+  constexpr std::size_t kFullHashLimit = 4096;
+  constexpr std::size_t kSampleWindow = 64;
+  constexpr std::size_t kMaxSamples = 256;
+
+  const std::size_t n = raw.size();
+  if (n <= kFullHashLimit) {
+    return std::hash<std::string>()(raw);
+  }
+
+  std::size_t seed = 0;
+  hash_combine(seed, std::hash<std::size_t>(), n);
+  // Evenly spaced windows across the buffer (always including offset 0),
+  // capped at kMaxSamples regardless of n -- so this whole function costs
+  // at most O(kMaxSamples * kSampleWindow) bytes hashed, a small constant,
+  // whether the tensor is 5KB or 500MB.
+  const std::size_t stride = std::max(kSampleWindow, n / kMaxSamples);
+  for (std::size_t offset = 0; offset < n; offset += stride) {
+    const std::size_t len = std::min(kSampleWindow, n - offset);
+    hash_combine(seed, std::hash<std::string_view>(),
+                 std::string_view(raw.data() + offset, len));
+  }
+  return seed;
 }
 
 struct SymbolCompare {
@@ -294,7 +339,13 @@ struct CSETensorHash {
       std::size_t seed = 0;
       hash_combine(seed, std::hash<int32_t>(), elem_type);
       hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());
-      hash_combine(seed, std::hash<std::string>(), tensor->raw());
+      // Bounded-cost sampled hash rather than std::hash<std::string> over
+      // the full buffer -- see HashRawDataBounded's own comment for why a
+      // sampled hash here is safe, and why the full-buffer scan (paid once
+      // per distinct tensor, not something g_raw_hash_cache above can
+      // amortize away) was worth cutting.
+      seed ^= HashRawDataBounded(tensor->raw()) + 0x9e3779b9 + (seed << 6) +
+              (seed >> 2);
       g_raw_hash_cache.emplace(id, seed);
 
       if (profiling) {
