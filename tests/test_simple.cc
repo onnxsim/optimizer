@@ -6,6 +6,9 @@
 #include <onnxoptimizer/optimize.h>
 #include <onnx/defs/parser.h>
 
+#include <unordered_set>
+
+#include "onnxoptimizer/passes/cse_util.h"
 #include "onnxoptimizer/passes/tensor_content_hash.h"
 
 TEST(OptimizerTest, NopReshape) {
@@ -130,6 +133,70 @@ TEST(OptimizerTest, EliminateDuplicateInitializerTrustHash) {
         }
     }
     onnx::optimization::SetTrustTensorContentHash(true);  // restore the default
+}
+
+// HashRawDataBounded (cse_util.h) samples rather than fully hashes raw_data
+// past kFullHashLimit, so two distinct large tensors that differ only
+// outside the sampled windows can legitimately hash-collide -- this test
+// deliberately constructs that worst case and confirms eliminate_duplicate_
+// initializer still keeps both (CSETensorCompare's full memcmp is the sole
+// source of truth for equality, not the hash), alongside a genuinely
+// identical large pair still getting deduped as before.
+TEST(OptimizerTest, EliminateDuplicateInitializerLargeRawData) {
+    // Larger than kFullHashLimit (4096) and past the point where
+    // kMaxSamples (256) windows of kSampleWindow (64) bytes stop covering
+    // the whole buffer (n / 256 > 64, i.e. n > 16384), so there are real,
+    // unsampled gaps between windows.
+    constexpr size_t n = 100000;
+    const std::string base(n, 'A');
+    std::string differs_in_gap = base;
+    // Offset 300 sits in the gap between the first sampled window ([0, 64))
+    // and the second (starting at stride = max(64, n/256) = 390), so this
+    // byte is never sampled.
+    differs_in_gap[300] = 'B';
+
+    ASSERT_EQ(onnx::optimization::HashRawDataBounded(base),
+              onnx::optimization::HashRawDataBounded(differs_in_gap))
+        << "test assumption: the two buffers hash-collide despite differing";
+
+    onnx::ModelProto model;
+    model.set_ir_version(7);
+    model.add_opset_import()->set_version(10);
+    auto* graph = model.mutable_graph();
+    graph->set_name("g");
+
+    auto add_init = [&](const std::string& name, const std::string& raw) {
+        auto* t = graph->add_initializer();
+        t->set_name(name);
+        t->set_data_type(onnx::TensorProto_DataType_UINT8);
+        t->add_dims(static_cast<int64_t>(n));
+        t->set_raw_data(raw);
+    };
+    // w1/w2: hash-colliding but byte-distinct -- must NOT be merged.
+    add_init("w1", base);
+    add_init("w2", differs_in_gap);
+    // w3/w4: genuinely identical -- must still be merged.
+    add_init("w3", base);
+    add_init("w4", base);
+
+    for (const char* name : {"w1", "w2", "w3", "w4"}) {
+        auto* n_ = graph->add_node();
+        n_->set_op_type("Identity");
+        n_->add_input(name);
+        n_->add_output(onnx::optimization::Str("out_", name));
+        graph->add_output()->set_name(onnx::optimization::Str("out_", name));
+    }
+
+    auto optimized =
+        onnx::optimization::Optimize(model, {"eliminate_duplicate_initializer"});
+    std::unordered_set<std::string> remaining;
+    for (const auto& init : optimized.graph().initializer()) {
+        remaining.insert(init.name());
+    }
+    EXPECT_EQ(remaining.count("w1"), 1u) << "hash-colliding but distinct: kept";
+    EXPECT_EQ(remaining.count("w2"), 1u) << "hash-colliding but distinct: kept";
+    EXPECT_EQ(remaining.count("w3") + remaining.count("w4"), 1u)
+        << "genuinely identical: deduped to one";
 }
 
 // Regression test for a real model-regression finding: on ~90 real-world
