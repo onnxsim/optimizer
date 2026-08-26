@@ -172,6 +172,7 @@ class cmake_build(setuptools.Command):
                 "-DONNX_OPT_USE_SYSTEM_PROTOBUF={}".format(
                     "ON" if ONNX_OPT_USE_SYSTEM_PROTOBUF else "OFF"
                 ),
+                "-DONNX_USE_LITE_PROTO={}".format("ON" if ONNX_USE_LITE_PROTO else "OFF"),
             ]
             if IS_FREE_THREADED:
                 # CMake's FindPython3 defaults to the standard ABI and cannot
