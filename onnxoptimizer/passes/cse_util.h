@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <string_view>
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
@@ -133,6 +134,58 @@ void hash_combine(std::size_t& seed, const Hasher& hasher, const T& v,
                   Rest... rest) {
   seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
   hash_combine(seed, rest...);
+}
+
+// Shared by HashRawDataBounded (raw_data tensors) and HashTypedFieldBounded
+// (typed-field tensors, via their ParseTensorData<T>-parsed byte
+// representation) below -- takes a generic byte span rather than a
+// std::string specifically, since the typed-field caller has no std::string
+// to hand it (its bytes live in a std::vector<T>). Cost is bounded by a
+// small constant, however large the buffer is -- unlike g_raw_hash_cache
+// above, a tensor's *first* hash is not a caching gap: it's paid exactly
+// once no matter what (see that cache's own comment), so on raw_data-heavy
+// models with large tensors it was this function's previous
+// std::hash<std::string>() full-buffer scan, not a cache miss, that
+// dominated eliminate_duplicate_initializer's cost (see onnxsim issue #633
+// follow-up profiling).
+//
+// This is safe to make approximate: CSETensorHash only needs to be a good
+// *bucketing* key. The sole source of truth for equality is
+// CSETensorCompare's raw_data fast path -- a full lhs->raw() == rhs->raw()
+// memcmp, run on every hash-bucket hit regardless of how the hash was
+// computed -- so a lower-quality/sampled hash can never cause an incorrect
+// merge. The only cost of a spurious collision (two distinct tensors that
+// happen to match on the sampled bytes) is one extra, already-cheap memcmp
+// against a candidate that turns out not to match.
+inline std::size_t HashBytesBounded(const char* data, std::size_t n) {
+  // Below this size, a full hash is already cheap -- and exact rather than
+  // sampled, so small buffers keep today's collision behavior exactly.
+  constexpr std::size_t kFullHashLimit = 4096;
+  constexpr std::size_t kSampleWindow = 64;
+  constexpr std::size_t kMaxSamples = 256;
+
+  if (n <= kFullHashLimit) {
+    return std::hash<std::string_view>()(std::string_view(data, n));
+  }
+
+  std::size_t seed = 0;
+  hash_combine(seed, std::hash<std::size_t>(), n);
+  // Evenly spaced windows across the buffer (always including offset 0),
+  // capped at kMaxSamples regardless of n -- so this whole function costs
+  // at most O(kMaxSamples * kSampleWindow) bytes hashed, a small constant,
+  // whether the buffer is 5KB or 500MB.
+  const std::size_t stride = std::max(kSampleWindow, n / kMaxSamples);
+  for (std::size_t offset = 0; offset < n; offset += stride) {
+    const std::size_t len = std::min(kSampleWindow, n - offset);
+    hash_combine(seed, std::hash<std::string_view>(),
+                 std::string_view(data + offset, len));
+  }
+  return seed;
+}
+
+// CSETensorHash's raw_data path (below): thin wrapper over HashBytesBounded.
+inline std::size_t HashRawDataBounded(std::string_view raw) {
+  return HashBytesBounded(raw.data(), raw.size());
 }
 
 struct SymbolCompare {
@@ -260,6 +313,113 @@ struct CSEContainerHash {
   }
 };
 
+// Local copies of tensor_content_hash.cc's CanonicalizeZero: that file's
+// version has internal (anonymous-namespace) linkage and so can't be called
+// from this translation unit. See that file's comment on the original
+// float/double overloads for why this matters (IEEE754 +0.0/-0.0 must hash
+// equal, or CSE silently stops deduplicating Constant/initializer tensors
+// that differ only in a zero's sign -- a real regression, see onnxsim PR
+// #641). Complex64/Complex128 canonicalize both components.
+inline float CanonicalizeZero(float v) {
+  return v == 0.0f ? 0.0f : v;
+}
+inline double CanonicalizeZero(double v) {
+  return v == 0.0 ? 0.0 : v;
+}
+inline Complex64 CanonicalizeZero(Complex64 v) {
+  v.real_part = CanonicalizeZero(v.real_part);
+  v.imaginary_part = CanonicalizeZero(v.imaginary_part);
+  return v;
+}
+inline Complex128 CanonicalizeZero(Complex128 v) {
+  v.real_part = CanonicalizeZero(v.real_part);
+  v.imaginary_part = CanonicalizeZero(v.imaginary_part);
+  return v;
+}
+
+// CSETensorHash's typed-field path (below): mirrors
+// ComputeTensorContentDigest's per-dtype ParseTensorData<T> dispatch
+// (tensor_content_hash.cc), including the same signed-zero canonicalization
+// for FLOAT/DOUBLE/COMPLEX64/COMPLEX128, but hashes each parsed vector's
+// bytes with HashBytesBounded instead of a full BLAKE3 pass -- same
+// bucketing-only-needs-to-be-approximate reasoning as HashRawDataBounded
+// above (CSETensorCompare's typed-field path, or TensorContentDigest
+// equality under GetTrustTensorContentHash(), remains the sole source of
+// truth for equality on any hash-bucket hit). ParseTensorData<T> itself is
+// already cheap here (a std::vector copy, no byte-swapping unlike the
+// raw_data branch) -- it was the subsequent full-buffer BLAKE3 hash that
+// dominated eliminate_duplicate_initializer's cost on typed-field-heavy
+// models (see onnxsim issue #633 follow-up profiling).
+inline std::size_t HashTypedFieldBounded(const Tensor& tensor) {
+  const int32_t elem_type = tensor.elem_type();
+  std::size_t seed = 0;
+  hash_combine(seed, std::hash<int32_t>(), elem_type);
+  hash_combine(seed, CSEContainerHash<int64_t>(), tensor.sizes());
+
+#define HASH_CASE(pb_type, cpp_type)                                       \
+  case ONNX_NAMESPACE::TensorProto_DataType_##pb_type: {                   \
+    const auto values = ParseTensorData<cpp_type>(&tensor);                \
+    seed ^= HashBytesBounded(reinterpret_cast<const char*>(values.data()), \
+                             values.size() * sizeof(cpp_type)) +           \
+            0x9e3779b9 + (seed << 6) + (seed >> 2);                        \
+    break;                                                                 \
+  }
+
+#define HASH_CASE_CANON(pb_type, cpp_type)                                 \
+  case ONNX_NAMESPACE::TensorProto_DataType_##pb_type: {                   \
+    auto values = ParseTensorData<cpp_type>(&tensor);                      \
+    for (auto& v : values)                                                 \
+      v = CanonicalizeZero(v);                                             \
+    seed ^= HashBytesBounded(reinterpret_cast<const char*>(values.data()), \
+                             values.size() * sizeof(cpp_type)) +           \
+            0x9e3779b9 + (seed << 6) + (seed >> 2);                        \
+    break;                                                                 \
+  }
+
+  switch (elem_type) {
+    HASH_CASE(INT8, int8_t)
+    HASH_CASE(INT16, int16_t)
+    HASH_CASE(INT32, int32_t)
+    HASH_CASE(INT64, int64_t)
+    HASH_CASE(UINT8, uint8_t)
+    HASH_CASE(UINT16, uint16_t)
+    HASH_CASE(UINT32, uint32_t)
+    HASH_CASE(UINT64, uint64_t)
+    HASH_CASE(FLOAT16, Float16)
+    HASH_CASE(BFLOAT16, BFloat16)
+
+    HASH_CASE_CANON(FLOAT, float)
+    HASH_CASE_CANON(DOUBLE, double)
+    HASH_CASE_CANON(COMPLEX64, Complex64)
+    HASH_CASE_CANON(COMPLEX128, Complex128)
+
+#undef HASH_CASE
+#undef HASH_CASE_CANON
+
+    case ONNX_NAMESPACE::TensorProto_DataType_BOOL: {
+      // std::vector<bool> is bit-packed, not a contiguous array of
+      // byte-sized elements -- pack one byte per value first, matching
+      // ComputeTensorContentDigest's BOOL case.
+      const auto values = ParseTensorData<bool>(&tensor);
+      std::string packed(values.size(), '\0');
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        packed[i] = values[i] ? 1 : 0;
+      }
+      seed ^= HashBytesBounded(packed.data(), packed.size()) + 0x9e3779b9 +
+              (seed << 6) + (seed >> 2);
+      break;
+    }
+    case ONNX_NAMESPACE::TensorProto_DataType_UNDEFINED:
+      // tensor is empty
+      break;
+    default:
+      throw std::runtime_error(
+          Str("HashTypedFieldBounded: no supported data type: ", elem_type));
+  }
+
+  return seed;
+}
+
 struct CSETensorHash {
   std::size_t operator()(const Tensor* tensor) const {
     /// https://github.com/onnx/onnx/issues/2630
@@ -294,7 +454,13 @@ struct CSETensorHash {
       std::size_t seed = 0;
       hash_combine(seed, std::hash<int32_t>(), elem_type);
       hash_combine(seed, CSEContainerHash<int64_t>(), tensor->sizes());
-      hash_combine(seed, std::hash<std::string>(), tensor->raw());
+      // Bounded-cost sampled hash rather than std::hash<std::string> over
+      // the full buffer -- see HashRawDataBounded's own comment for why a
+      // sampled hash here is safe, and why the full-buffer scan (paid once
+      // per distinct tensor, not something g_raw_hash_cache above can
+      // amortize away) was worth cutting.
+      seed ^= HashRawDataBounded(tensor->raw()) + 0x9e3779b9 + (seed << 6) +
+              (seed >> 2);
       g_raw_hash_cache.emplace(id, seed);
 
       if (profiling) {
@@ -310,18 +476,15 @@ struct CSETensorHash {
     }
 
     if (elem_type != ONNX_NAMESPACE::TensorProto_DataType_STRING) {
-      // Typed-field, non-STRING: TensorContentDigest (tensor_content_hash.h,
-      // memoized per tensor pointer for this pass call) already folds
-      // dtype + shape + values into one BLAKE3 pass, so hash THAT instead
-      // of redoing the work here. This is purely a faster/better bucketing
-      // key and holds regardless of GetTrustTensorContentHash():
-      // CSETensorCompare (which that toggle does gate) still runs its own
-      // check on any bucket collision, so using this hash can never by
-      // itself cause two distinct tensors to be merged, whichever way that
-      // toggle is set.
+      // Typed-field, non-STRING: bounded-cost sampled hash rather than
+      // TensorContentDigest's full BLAKE3 pass over every element -- see
+      // HashTypedFieldBounded's own comment for why a sampled hash here is
+      // safe (bucketing only; CSETensorCompare's typed-field path, gated by
+      // GetTrustTensorContentHash(), is still the sole source of truth for
+      // equality either way) and why the full pass was worth cutting.
       ScopedCSETiming _t(&g_cse_hash_compare_timing.typed_hash_calls,
                          &g_cse_hash_compare_timing.typed_hash_ms);
-      return std::hash<std::string>()(TensorContentDigest(*tensor));
+      return HashTypedFieldBounded(*tensor);
     }
 
     // Only STRING reaches here.
