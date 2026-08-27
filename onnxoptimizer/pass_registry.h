@@ -23,6 +23,7 @@
 #include "onnxoptimizer/passes/eliminate_duplicate_initializer.h"
 #include "onnxoptimizer/passes/eliminate_identity.h"
 #include "onnxoptimizer/passes/eliminate_if_with_const_cond.h"
+#include "onnxoptimizer/passes/eliminate_loop_with_const_trip_count.h"
 #include "onnxoptimizer/passes/eliminate_nop_cast.h"
 #include "onnxoptimizer/passes/eliminate_nop_concat.h"
 #include "onnxoptimizer/passes/eliminate_nop_dropout.h"
@@ -85,6 +86,7 @@ struct GlobalPassRegistry {
     registerPass<ExtractConstantToInitializer>();
     registerPass<EliminateConsecutiveIdempotentOps>();
     registerPass<EliminateIfWithConstCond>();
+    registerPass<EliminateLoopWithConstTripCount>();
     registerPass<EliminateNopMonotoneArgmax>();
     registerPass<EliminateNopPad>();
     registerPass<EliminateNopConcat>();
