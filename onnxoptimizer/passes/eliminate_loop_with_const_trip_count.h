@@ -247,8 +247,12 @@ struct EliminateLoopWithConstTripCount final : public PredicateBasedPass {
               ONNX_ASSERT(body->is_constant_initializer(input));
               const Tensor &initializer_subgraph =
                   *body->getInitializer(unique_name);
-              // copy a new tensor
+              // Copy the tensor under a fresh name: the body is inlined once
+              // per iteration, so reusing its original initializer name
+              // verbatim would add several distinctly-owned initializers
+              // under the same name to parent_graph, one per iteration.
               Tensor initializer_parent_graph = initializer_subgraph;
+              initializer_parent_graph.setName(parent_graph.getNextUniqueName());
               new_node->addInput(parent_graph.addInitializerAndCreateValue(
                   initializer_parent_graph));
             } else {
@@ -292,6 +296,7 @@ struct EliminateLoopWithConstTripCount final : public PredicateBasedPass {
             const Tensor &initializer_subgraph =
                 *body->getInitializer(unique_name);
             Tensor initializer_parent_graph = initializer_subgraph;
+            initializer_parent_graph.setName(parent_graph.getNextUniqueName());
             resolved = parent_graph.addInitializerAndCreateValue(
                 initializer_parent_graph);
           } else {
