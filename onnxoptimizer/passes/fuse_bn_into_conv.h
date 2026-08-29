@@ -56,11 +56,11 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
     auto bn_mean = *FetchConstantTensor(bn_inputs[3]);
     auto bn_var = *FetchConstantTensor(bn_inputs[4]);
     auto conv_W = *FetchConstantTensor(conv_inputs[1]);
-    bn_scale.setName(graph.getNextUniqueName());
-    bn_bias.setName(graph.getNextUniqueName());
-    bn_mean.setName(graph.getNextUniqueName());
-    bn_var.setName(graph.getNextUniqueName());
-    conv_W.setName(graph.getNextUniqueName());
+    bn_scale.setName(nextReservedName(graph));
+    bn_bias.setName(nextReservedName(graph));
+    bn_mean.setName(nextReservedName(graph));
+    bn_var.setName(nextReservedName(graph));
+    conv_W.setName(nextReservedName(graph));
 
     /// scale bias mean var must be the same shape (C)
     ONNX_ASSERT(bn_scale.sizes() == bn_bias.sizes());
@@ -82,7 +82,7 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
         return false;
       }
       auto bc_t = *FetchConstantTensor(conv_inputs[2]);
-      bc_t.setName(ONNX_NAMESPACE::toVarName(graph.getNextUnique()));
+      bc_t.setName(nextReservedName(graph));
       ONNX_ASSERT(bc_t.sizes() == bn_scale.sizes());
       conv_bias = graph.addInitializerAndCreateValue(bc_t);
     } else {
@@ -212,6 +212,27 @@ struct FuseBNIntoConv final : public PredicateBasedPass {
     }
     destroy_current = NodeDestroyType::DestroyOne;
     return true;
+  }
+
+ private:
+  // modify_conv() above draws 5-6 fresh initializer names per BN-fusion
+  // match (bn_scale/bias/mean/var, conv_W, and optionally the conv bias). A
+  // graph with many BatchNorm layers fires this once per match, so unbatched
+  // getNextUniqueName()/getNextUnique() calls would each pay a full graph
+  // (+ subgraph) scan via isNameUnique() -- dozens to hundreds of scans per
+  // simplify() call. Batch the draws instead (see
+  // onnxsim/passes/fuse_bn_into_conv.h's nextReservedName() for the same
+  // pattern, and set_unique_name_for_nodes.h in this directory).
+  static constexpr size_t kNameBatchSize = 252;  // multiple of 6
+  std::vector<std::string> reserved_names_;
+  size_t reserved_used_ = 0;
+
+  std::string nextReservedName(Graph& graph) {
+    if (reserved_used_ >= reserved_names_.size()) {
+      reserved_names_ = graph.reserveUniqueNames(kNameBatchSize);
+      reserved_used_ = 0;
+    }
+    return std::move(reserved_names_[reserved_used_++]);
   }
 };
 
