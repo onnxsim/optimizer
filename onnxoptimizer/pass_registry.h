@@ -136,8 +136,16 @@ struct GlobalPassRegistry {
                  pass_name.c_str());
     return it->second;
   }
+  // Sorted by name (std::map key order), so the listing does not depend on
+  // registration order. pass_names keeps registration order on purpose:
+  // GetFuseAndEliminationPass() walks it to build the default pass order.
   const std::vector<std::string> GetAvailablePasses() {
-    return pass_names;
+    std::vector<std::string> names;
+    names.reserve(passes.size());
+    for (const auto& entry : passes) {
+      names.push_back(entry.first);
+    }
+    return names;
   }
 
   const std::vector<std::string> GetFuseAndEliminationPass();
