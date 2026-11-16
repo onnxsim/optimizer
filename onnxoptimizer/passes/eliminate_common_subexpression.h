@@ -6,6 +6,8 @@
 // Adventurous users should note that the APIs will probably change.
 #pragma once
 
+#include <optional>
+
 #include <chrono>
 #include <unordered_map>
 
@@ -44,11 +46,13 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
     double lookup_ms = 0.0;
     double replace_ms = 0.0;
     std::unordered_map<Node *, Node *, CSENodeHash, CSEEqual> hash_map;
-    // See eliminate_deadend.h's identical use of GraphMayHaveCapturedValues
-    // for why this turns hasUses() from an accidental O(nodes) cost on every
-    // one of this loop's O(nodes) iterations into O(1), for the overwhelming
-    // majority of graphs that have no control-flow ops at all.
+    // Same-graph use counts replace hasUses() (a full-graph scan per call)
+    // when no capture is possible; see SameGraphUseCounts.
     const bool may_have_captures = GraphMayHaveCapturedValues(graph);
+    std::optional<SameGraphUseCounts> use_counts;
+    if (!may_have_captures) {
+      use_counts.emplace(graph);
+    }
     for (auto it = node_list.begin(); it != node_list.end(); ++it) {
       auto node = *it;
       auto kind = node->kind();
@@ -56,14 +60,12 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
       bool skip;
       if (profiling) {
         const auto t0 = std::chrono::steady_clock::now();
-        skip = (may_have_captures ? !node->hasUses()
-                                  : !node->hasUsesInCurrentGraph()) ||
+        skip = (may_have_captures ? !node->hasUses() : !use_counts->hasUses(node)) ||
                !IsSupportedByCSE(node);
         const auto t1 = std::chrono::steady_clock::now();
         filter_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
       } else {
-        skip = (may_have_captures ? !node->hasUses()
-                                  : !node->hasUsesInCurrentGraph()) ||
+        skip = (may_have_captures ? !node->hasUses() : !use_counts->hasUses(node)) ||
                !IsSupportedByCSE(node);
       }
       if (skip) {
@@ -94,6 +96,9 @@ struct EliminateCommonSubexpression final : public FullGraphBasedPass {
           t2 = std::chrono::steady_clock::now();
         for (int i = 0; i < outputs.size(); ++i) {
           if (tryReplacingAllUsesWith(replaced_outputs[i], outputs[i])) {
+            if (use_counts) {
+              use_counts->onReplaced(replaced_outputs[i], outputs[i]);
+            }
             VLOG(1) << Str("kind: ", kind.toString(), ", ", node->name(), " [",
                            i, "] output has been replaced by ", other->name());
             cse_removed++;

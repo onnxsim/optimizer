@@ -6,6 +6,7 @@
 // Adventurous users should note that the APIs will probably change.
 #pragma once
 #include <chrono>
+#include <optional>
 
 #include "onnxoptimizer/pass.h"
 #include "onnxoptimizer/passes/pass_util.h"
@@ -28,14 +29,14 @@ struct EliminateDeadEnd final : public FullGraphBasedPass {
     double has_uses_ms = 0.0;
     double destroy_ms = 0.0;
     // hasUses() pays a full graph (and subgraph) scan on every call, purely
-    // to catch a value captured by a nested If/Loop/Scan subgraph body -- see
-    // GraphMayHaveCapturedValues's comment. Almost no real graph has any
-    // control-flow ops at all, so computing this once up front and using the
-    // O(1) hasUsesInCurrentGraph() below turns this pass from accidentally
-    // quadratic (this loop's O(nodes) times hasUses()'s own O(nodes)) into
-    // linear for that overwhelmingly common case, with no behavior change
-    // when a capture is possible (falls back to the exact previous check).
+    // to catch a value captured by a nested If/Loop/Scan body. When no
+    // capture is possible, track exact same-graph use counts instead, so each
+    // check is O(1) and the pass stays linear (see SameGraphUseCounts).
     const bool may_have_captures = GraphMayHaveCapturedValues(graph);
+    std::optional<SameGraphUseCounts> use_counts;
+    if (!may_have_captures) {
+        use_counts.emplace(graph);
+    }
     auto nodes = graph.nodes().reverse();
     for (auto it = nodes.begin(); it != nodes.end(); it++) {
       auto node = *it;
@@ -44,16 +45,19 @@ struct EliminateDeadEnd final : public FullGraphBasedPass {
       if (profiling) {
         const auto t0 = std::chrono::steady_clock::now();
         has_uses =
-            may_have_captures ? node->hasUses() : node->hasUsesInCurrentGraph();
+            may_have_captures ? node->hasUses() : use_counts->hasUses(node);
         const auto t1 = std::chrono::steady_clock::now();
         has_uses_ms +=
             std::chrono::duration<double, std::milli>(t1 - t0).count();
       } else {
         has_uses =
-            may_have_captures ? node->hasUses() : node->hasUsesInCurrentGraph();
+            may_have_captures ? node->hasUses() : use_counts->hasUses(node);
       }
       if (!has_uses) {
         nodes_removed++;
+        if (use_counts) {
+          use_counts->onInputsRemoved(node);
+        }
         if (profiling) {
           const auto t0 = std::chrono::steady_clock::now();
           it.destroyCurrent();
