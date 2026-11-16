@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include <algorithm>
 #include <type_traits>
 
@@ -489,17 +491,12 @@ struct ToCppType<TensorProto_DataType_BOOL> {
 };
 
 // Whether ``graph`` (including any nested If/Loop/Scan subgraph bodies)
-// contains a ``kCaptured`` placeholder node -- the only thing
-// Value::uses()'s extra owningGraph()->forEachNode() scan (on top of the
-// O(1) uses_in_current_graph_ it always includes) can ever find; see that
-// method's definition in onnx/common/ir.h. When this is false, every
-// value's uses() is exactly its uses_in_current_graph_, so a caller that
-// needs many nodes' hasUses() in a tight loop (eliminate_deadend,
-// eliminate_common_subexpression) can compute this once up front and use
-// the O(1) Value/Node::hasUsesInCurrentGraph() instead of paying uses()'s
-// O(graph size) subgraph scan on every single node -- turning an
-// accidentally-quadratic full-graph pass into a linear one for the common
-// case of a graph with no control-flow ops at all (see onnxsim issue #651).
+// contains a ``kCaptured`` placeholder node. Value::uses() (onnx/common/ir.h)
+// always returns the graph's own use list, and additionally scans every
+// nested subgraph for a ``kCaptured`` node that references the value. When
+// this is false that extra scan can never find anything, so a value's uses
+// are exactly its same-graph input references, which SameGraphUseCounts
+// tracks in O(1) per query.
 inline bool GraphMayHaveCapturedValues(const Graph& graph) {
   bool found = false;
   graph.forEachNode([&found](const Node* node) {
@@ -509,6 +506,62 @@ inline bool GraphMayHaveCapturedValues(const Graph& graph) {
   });
   return found;
 }
+
+// Exact per-value count of the input slots that reference it, across every
+// node of ``graph`` plus its return node (which holds the graph outputs).
+// This is what Value::uses() reports when GraphMayHaveCapturedValues() is
+// false, so ``hasUses(node)`` matches ``node->hasUses()`` for such graphs.
+//
+// Passes that mutate the graph while iterating must keep it in sync:
+// call onInputsRemoved() before destroying a node, and onReplaced() after
+// moving all uses of one value onto another.
+class SameGraphUseCounts {
+ public:
+  explicit SameGraphUseCounts(const Graph& graph) {
+    // Only this graph's own nodes: forEachNode() would also descend into
+    // subgraphs, whose inputs are not same-graph uses of these values.
+    const Node* ret = graph.return_node();
+    for (const Node* node : graph.nodes()) {
+      if (node != ret) {
+        addInputs(node, 1);
+      }
+    }
+    addInputs(ret, 1);
+  }
+
+  bool hasUses(const Node* node) const {
+    for (const Value* output : node->outputs()) {
+      auto it = counts_.find(output);
+      if (it != counts_.end() && it->second > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Call before destroying ``node``: its inputs lose one use each.
+  void onInputsRemoved(const Node* node) { addInputs(node, -1); }
+
+  // Call after replaceAllUsesWith(old_value -> new_value): every use of
+  // ``old_value`` now refers to ``new_value``.
+  void onReplaced(const Value* old_value, const Value* new_value) {
+    auto it = counts_.find(old_value);
+    if (it == counts_.end() || it->second == 0) {
+      return;
+    }
+    counts_[new_value] += it->second;
+    it->second = 0;
+  }
+
+ private:
+  void addInputs(const Node* node, int delta) {
+    for (const Value* input : node->inputs()) {
+      counts_[input] += delta;
+    }
+  }
+
+  std::unordered_map<const Value*, int64_t> counts_;
+};
 
 }  // namespace optimization
 
