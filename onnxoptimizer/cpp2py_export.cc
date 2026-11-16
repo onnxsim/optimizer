@@ -3,8 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+
+#include <map>
 
 #include "onnxoptimizer/model_util.h"
 #include "onnxoptimizer/optimize.h"
@@ -56,6 +60,30 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
       });
 
   onnx_opt_cpp2py_export.def(
+      "optimize_report",
+      [](const nb::bytes& bytes, const std::vector<std::string>& names) {
+        ModelProto proto{};
+        ParseProtoFromPyBytes(&proto, bytes);
+        std::map<std::string, unsigned int> report;
+        auto const result = optimization::Optimize(proto, names, &report);
+        std::string out;
+        result.SerializeToString(&out);
+        return std::make_pair(nb::bytes(out.data(), out.size()), report);
+      });
+
+  onnx_opt_cpp2py_export.def(
+      "optimize_fixedpoint_report",
+      [](const nb::bytes& bytes, const std::vector<std::string>& names) {
+        ModelProto proto{};
+        ParseProtoFromPyBytes(&proto, bytes);
+        std::map<std::string, unsigned int> report;
+        auto const result = optimization::OptimizeFixed(proto, names, &report);
+        std::string out;
+        result.SerializeToString(&out);
+        return std::make_pair(nb::bytes(out.data(), out.size()), report);
+      });
+
+  onnx_opt_cpp2py_export.def(
       "optimize_from_path", [](const std::string& import_model_path,
                                const std::string& export_model_path,
                                const std::vector<std::string>& names,
@@ -66,6 +94,21 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
             static_cast<const ModelProto&>(proto), names);
         optimization::saveModel(&result, export_model_path, true,
                                 export_data_file_name);
+      });
+
+  onnx_opt_cpp2py_export.def(
+      "optimize_from_path_report",
+      [](const std::string& import_model_path,
+         const std::string& export_model_path,
+         const std::vector<std::string>& names,
+         const std::string& export_data_file_name) {
+        ModelProto proto{};
+        optimization::loadModel(&proto, import_model_path, true);
+        std::map<std::string, unsigned int> report;
+        auto result = optimization::Optimize(proto, names, &report);
+        optimization::saveModel(&result, export_model_path, true,
+                                export_data_file_name);
+        return report;
       });
 
   onnx_opt_cpp2py_export.def(
@@ -80,6 +123,21 @@ NB_MODULE(onnx_opt_cpp2py_export, onnx_opt_cpp2py_export) {
             static_cast<const ModelProto&>(proto), names);
         optimization::saveModel(&result, export_model_path, true,
                                 export_data_file_name);
+      });
+
+  onnx_opt_cpp2py_export.def(
+      "optimize_fixedpoint_from_path_report",
+      [](const std::string& import_model_path,
+         const std::string& export_model_path,
+         const std::vector<std::string>& names,
+         const std::string& export_data_file_name) {
+        ModelProto proto{};
+        optimization::loadModel(&proto, import_model_path, true);
+        std::map<std::string, unsigned int> report;
+        auto result = optimization::OptimizeFixed(proto, names, &report);
+        optimization::saveModel(&result, export_model_path, true,
+                                export_data_file_name);
+        return report;
       });
   onnx_opt_cpp2py_export.def("get_available_passes",
                              &optimization::GetAvailablePasses);
