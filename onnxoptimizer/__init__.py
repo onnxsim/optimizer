@@ -37,22 +37,30 @@ def optimize(
     passes: list[str] | None = None,
     fixed_point: bool = False,
     initializers_as_constants: bool = True,
-) -> onnx.ModelProto:
+    return_report: bool = False,
+) -> onnx.ModelProto | tuple[onnx.ModelProto, dict[str, int]]:
     """Apply the optimization on the serialized ModelProto.
 
     Arguments:
         model: ONNX model.
         passes: Optimization names.
-        fixed_point: Whether to run the passes to a fixed point.
+        fixed_point: Whether to repeatedly apply the passes until the graph
+            reaches a fixed point.
         initializers_as_constants: Whether the passes may treat graph
             initializers as constant tensors (the default, ``True``). When set
             to ``False`` initializers are treated as non-constant, so
             value-baking passes such as ``fuse_bn_into_conv`` leave
             initializer-backed weights untouched; ``Constant`` nodes are still
             treated as constants.
+        return_report: When ``True``, also return a report describing how many
+            times each pass modified the graph.
 
     Return:
-        Optimized model.
+        The optimized model. When ``return_report`` is ``True``, a tuple of
+        ``(optimized_model, report)`` is returned instead, where ``report`` is a
+        ``dict`` mapping each pass name to the total number of positive
+        (successful) transforms it applied. A pass that ran without changing the
+        graph maps to ``0``; passes absent from the map did not report a count.
     """
 
     if passes is None:
@@ -65,16 +73,27 @@ def optimize(
     previous = _c.initializers_as_constants()
     _c.set_initializers_as_constants(initializers_as_constants)
     try:
-        return _optimize_impl(model, passes, fixed_point)
+        return _optimize_impl(model, passes, fixed_point, return_report)
     finally:
         _c.set_initializers_as_constants(previous)
 
 
 def _optimize_impl(
-    model: onnx.ModelProto, passes: list[str], fixed_point: bool
-) -> onnx.ModelProto:
+    model: onnx.ModelProto,
+    passes: list[str],
+    fixed_point: bool,
+    return_report: bool = False,
+) -> onnx.ModelProto | tuple[onnx.ModelProto, dict[str, int]]:
     try:
         model_str = model.SerializeToString()
+        if return_report:
+            if fixed_point:
+                optimized_model_str, report = _c.optimize_fixedpoint_report(
+                    model_str, passes
+                )
+            else:
+                optimized_model_str, report = _c.optimize_report(model_str, passes)
+            return onnx.load_from_string(optimized_model_str), report
         if fixed_point:
             optimized_model_str = _c.optimize_fixedpoint(model_str, passes)
         else:
@@ -102,7 +121,17 @@ def _optimize_impl(
                     location=data_src_rel_filename,
                     convert_attribute=True,
                 )
-                if fixed_point:
+                report = None
+                if return_report:
+                    if fixed_point:
+                        report = _c.optimize_fixedpoint_from_path_report(
+                            file_src.name, file_dest.name, passes, data_dest_rel_filename
+                        )
+                    else:
+                        report = _c.optimize_from_path_report(
+                            file_src.name, file_dest.name, passes, data_dest_rel_filename
+                        )
+                elif fixed_point:
                     _c.optimize_fixedpoint_from_path(
                         file_src.name, file_dest.name, passes, data_dest_rel_filename
                     )
@@ -110,7 +139,10 @@ def _optimize_impl(
                     _c.optimize_from_path(
                         file_src.name, file_dest.name, passes, data_dest_rel_filename
                     )
-                return onnx.load(file_dest.name, load_external_data=True)
+                optimized = onnx.load(file_dest.name, load_external_data=True)
+                if return_report:
+                    return optimized, report
+                return optimized
             finally:
                 os.remove(file_src.name)
                 os.remove(file_dest.name)
